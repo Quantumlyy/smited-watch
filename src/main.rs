@@ -122,8 +122,9 @@ async fn run_with_config(cli: Cli) -> anyhow::Result<i32> {
 ///
 /// The child inherits our pgrp by default (we do *not* call
 /// `process_group(0)`), so a Ctrl-C in the parent terminal reaches both
-/// us and the child via the kernel's foreground-pgrp delivery — no
-/// signal-handler plumbing needed.
+/// us and the child via the kernel's foreground-pgrp delivery. We
+/// temporarily ignore SIGINT in the wrapper while waiting so the child can
+/// trap or handle Ctrl-C and we can still return its actual exit status.
 fn run_disabled_passthrough(cmd: Vec<std::ffi::OsString>) -> i32 {
     use std::process::{Command, Stdio};
     if cmd.is_empty() {
@@ -143,11 +144,47 @@ fn run_disabled_passthrough(cmd: Vec<std::ffi::OsString>) -> i32 {
             return 1;
         }
     };
+    #[cfg(unix)]
+    let _signal_guard = SignalRestoreGuard::ignore(&[libc::SIGINT]);
     match child.wait() {
         Ok(status) => propagate_exit_code(status),
         Err(e) => {
             eprintln!("[smited-watch] failed to wait on child: {e}");
             1
+        }
+    }
+}
+
+#[cfg(unix)]
+struct SignalRestoreGuard {
+    old_handlers: Vec<(libc::c_int, libc::sighandler_t)>,
+}
+
+#[cfg(unix)]
+impl SignalRestoreGuard {
+    fn ignore(signals: &[libc::c_int]) -> Self {
+        let mut old_handlers = Vec::new();
+        for &signal in signals {
+            // SAFETY: disable mode is still single-threaded here, before
+            // the tokio runtime is created. The child has already been
+            // spawned, so it does not inherit the ignored disposition.
+            let old = unsafe { libc::signal(signal, libc::SIG_IGN) };
+            if old != libc::SIG_ERR {
+                old_handlers.push((signal, old));
+            }
+        }
+        Self { old_handlers }
+    }
+}
+
+#[cfg(unix)]
+impl Drop for SignalRestoreGuard {
+    fn drop(&mut self) {
+        for &(signal, old) in self.old_handlers.iter().rev() {
+            // SAFETY: restoring the exact handler returned by signal(2).
+            unsafe {
+                libc::signal(signal, old);
+            }
         }
     }
 }

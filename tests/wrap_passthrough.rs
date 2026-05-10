@@ -122,6 +122,82 @@ fn smited_watch_disable_envvar_makes_it_pure_passthrough() {
 
 #[cfg(unix)]
 #[test]
+fn disable_mode_preserves_sigint_trapping_child_exit_code() {
+    use std::os::unix::process::{CommandExt, ExitStatusExt};
+    use std::process::Stdio;
+
+    let (dir, cfg) = empty_config();
+    let ready_file = dir.path().join("ready");
+    let trap_file = dir.path().join("trapped");
+    let script = format!(
+        "trap 'echo trapped > {}; exit 42' INT; echo ready > {}; while :; do sleep 1; done",
+        trap_file.display(),
+        ready_file.display()
+    );
+
+    let mut child = {
+        let mut cmd = binary(&cfg);
+        cmd.env("SMITED_WATCH_DISABLE", "1")
+            .arg("--")
+            .arg("bash")
+            .arg("-c")
+            .arg(&script)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        // Make the wrapper a process-group leader so the test can emulate
+        // terminal Ctrl-C delivery to the whole foreground process group.
+        cmd.process_group(0);
+        cmd.spawn().expect("spawn smited-watch")
+    };
+    let wrapper_pid = child.id() as libc::pid_t;
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while !ready_file.exists() {
+        if std::time::Instant::now() > deadline {
+            unsafe {
+                libc::kill(-wrapper_pid, libc::SIGKILL);
+            }
+            let _ = child.wait();
+            panic!("child never became ready");
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+
+    unsafe {
+        libc::kill(-wrapper_pid, libc::SIGINT);
+    }
+
+    let status = {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            if let Some(status) = child.try_wait().expect("poll smited-watch") {
+                break status;
+            }
+            if std::time::Instant::now() > deadline {
+                unsafe {
+                    libc::kill(-wrapper_pid, libc::SIGKILL);
+                }
+                let _ = child.wait();
+                panic!("smited-watch did not exit after SIGINT");
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+    };
+
+    assert_eq!(
+        status.code(),
+        Some(42),
+        "disable mode should wait for the SIGINT-trapping child and propagate its exit code; status={status:?}, signal={:?}",
+        status.signal()
+    );
+    assert!(
+        trap_file.exists(),
+        "child trap should have run after process-group SIGINT"
+    );
+}
+
+#[cfg(unix)]
+#[test]
 fn sigint_is_forwarded_as_sigint_not_sigkill() {
     // Send SIGINT to smited-watch and verify the wrapped command exits
     // with signal=SIGINT (signum 2), proving the wrapper forwarded the
