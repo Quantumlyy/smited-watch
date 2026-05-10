@@ -1,0 +1,59 @@
+[package]
+name = "smited-watch"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+authors = ["Nejc Drobnič <nejc@nejc.dev>"]
+description = "Wraps a command and fires haptic sensations on the smited daemon when its output matches configured patterns."
+repository = "https://github.com/Quantumlyy/smited-watch"
+readme = "README.md"
+rust-version = "1.88"
+
+[[bin]]
+name = "smited-watch"
+path = "src/main.rs"
+
+[lib]
+name = "smited_watch"
+path = "src/lib.rs"
+
+[dependencies]
+tokio = { version = "1.52", features = ["full"] }
+tonic = "0.14"
+tonic-prost = "0.14"
+prost = "0.14"
+prost-types = "0.14"
+clap = { version = "4.6", features = ["derive", "env"] }
+serde = { version = "1", features = ["derive"] }
+toml = "1.1"
+regex = "1.12"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+anyhow = "1"
+thiserror = "2"
+portable-pty = "0.9"
+strip-ansi-escapes = "0.2"
+dirs = "6"
+crossterm = "0.29"
+bytes = "1.11"
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[build-dependencies]
+tonic-prost-build = "0.14"
+# Ships pre-built `protoc` binaries for major host triples so `cargo install`
+# from a fresh machine works without the user having to install protobuf
+# system packages first. Justified beyond the spec's dep list: tonic 0.14
+# moved codegen to `prost-build`, which delegates to a `protoc` invocation;
+# without this crate every consumer has to apt/brew/scoop install protobuf
+# before `cargo install --git …` succeeds, which contradicts the README's
+# "only a Rust toolchain" promise.
+protoc-bin-vendored = "3.2"
+
+[dev-dependencies]
+tempfile = "3"
+assert_cmd = "2"
+tokio = { version = "1.52", features = ["full", "test-util"] }
+tokio-stream = { version = "0.1", features = ["net"] }
+libc = "0.2"

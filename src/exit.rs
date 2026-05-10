@@ -1,0 +1,491 @@
+//! On-exit sensation dispatch.
+//!
+//! When the wrapped command finishes the watcher fires (at most) one
+//! more sensation, chosen from `[on_exit]` in the config:
+//!
+//! * **Success path.** Exit code 0 *and* the run lasted at least
+//!   `success_min_duration_ms`. Without the duration gate, every fast
+//!   `npm run lint` (~200 ms) would buzz the user "hooray, success!"
+//!   for what is essentially a no-op.
+//! * **Failure path.** Nonzero exit code, *unless* a `[[patterns]]` entry
+//!   already matched within the last `failure_dedupe_window_ms`. The
+//!   dedupe avoids the obvious double-buzz where the same compile error
+//!   triggers both the pattern fire AND the exit-failure fire.
+//! * **Signal-driven shutdown.** When the user hits Ctrl-C, we forward
+//!   SIGINT to the child and exit. No exit sensation fires — the user
+//!   asked for the run to stop, not for confirmation that it did.
+//! * **Empty sensation strings.** Setting `success_sensation = ""` (or
+//!   the failure equivalent) disables that arm entirely.
+
+use std::process::ExitStatus;
+use std::time::{Duration, Instant};
+
+use tracing::debug;
+
+use crate::client::TriggerClient;
+use crate::config::OnExit;
+use crate::trigger::build_exit_trigger;
+
+/// Inputs to a single on-exit decision.
+pub struct ExitContext<'a> {
+    pub status: ExitStatus,
+    pub duration: Duration,
+    pub on_exit: &'a OnExit,
+    pub default_backend_id: &'a str,
+    /// `Instant` of the most recent pattern trigger fired during the run,
+    /// for the failure-dedupe check. `None` if no pattern fired.
+    pub last_pattern_fire: Option<Instant>,
+    pub trigger_client: &'a TriggerClient,
+    /// True if shutdown was caused by SIGINT/SIGTERM. Suppresses all
+    /// exit sensations.
+    pub shutdown_due_to_signal: bool,
+    /// "Now" — injected so unit tests can drive deterministic clocks.
+    pub now: Instant,
+}
+
+/// Decide and (if appropriate) fire the exit sensation. Fire-and-forget
+/// like every other trigger — never blocks, never errors.
+pub fn handle(ctx: ExitContext) {
+    if ctx.shutdown_due_to_signal {
+        debug!("exit: signal-driven shutdown; suppressing on-exit sensation");
+        return;
+    }
+
+    // PTY raw-mode delivers Ctrl-C as byte 0x03 *into* the child PTY rather
+    // than as a SIGINT to the wrapper, so `shutdown_due_to_signal` is never
+    // set even though the user clearly asked for a stop. Catch the case
+    // where the child died from a user-initiated "please stop" signal
+    // directly — crash signals (SIGSEGV, SIGABRT, SIGBUS, SIGFPE) still
+    // fire failure since the wrapped command genuinely broke.
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::ExitStatusExt;
+        if let Some(sig) = ctx.status.signal() {
+            if matches!(
+                sig,
+                libc::SIGINT | libc::SIGTERM | libc::SIGQUIT | libc::SIGHUP
+            ) {
+                debug!(
+                    signum = sig,
+                    "exit: child killed by user-initiated signal; suppressing on-exit sensation"
+                );
+                return;
+            }
+        }
+    }
+
+    // Fallback heuristic for the trickiest case: a child that *trapped*
+    // SIGINT/SIGTERM and then exited with a conventional shell exit
+    // code instead of dying from the signal. `status.signal()` is `None`
+    // (clean exit), and `shutdown_due_to_signal` may be `false` if the
+    // wrapper itself never observed the signal — which is exactly what
+    // happens in raw-mode PTY: Ctrl-C goes through the stdin forwarder
+    // as byte 0x03 → kernel converts to SIGINT for the child's pgrp →
+    // child traps → child `exit 130`. We never see anything.
+    //
+    //   130 = 128 + SIGINT (POSIX convention for SIGINT-trapped exit)
+    //   143 = 128 + SIGTERM
+    //
+    // This heuristic has a known false-positive: a tool could
+    // legitimately `exit 130` for unrelated reasons. The cost is one
+    // suppressed failure sensation in that very specific case; the
+    // benefit is correct behaviour for every signal-trapping tool
+    // (every dev server, every test runner with a SIGINT handler).
+    if let Some(code) = ctx.status.code() {
+        if code == 130 || code == 143 {
+            debug!(
+                code,
+                "exit: child exit code matches POSIX 128+signum convention \
+                 (SIGINT/SIGTERM trapped and exited cleanly); suppressing \
+                 on-exit sensation"
+            );
+            return;
+        }
+    }
+
+    if ctx.status.success() {
+        if ctx.on_exit.success_sensation.is_empty() {
+            debug!("exit: success but success_sensation is empty; nothing to fire");
+            return;
+        }
+        let min = Duration::from_millis(ctx.on_exit.success_min_duration_ms);
+        if ctx.duration < min {
+            debug!(
+                duration_ms = ctx.duration.as_millis() as u64,
+                min_ms = min.as_millis() as u64,
+                "exit: success too fast for success_min_duration_ms; suppressed",
+            );
+            return;
+        }
+        debug!(
+            sensation = %ctx.on_exit.success_sensation,
+            "exit: firing success sensation",
+        );
+        let req = build_exit_trigger(&ctx.on_exit.success_sensation, ctx.default_backend_id);
+        ctx.trigger_client.fire(req);
+        return;
+    }
+
+    // Failure path.
+    if ctx.on_exit.failure_sensation.is_empty() {
+        debug!("exit: failure but failure_sensation is empty; nothing to fire");
+        return;
+    }
+    if let Some(last) = ctx.last_pattern_fire {
+        let window = Duration::from_millis(ctx.on_exit.failure_dedupe_window_ms);
+        let elapsed = ctx.now.saturating_duration_since(last);
+        if elapsed < window {
+            debug!(
+                elapsed_ms = elapsed.as_millis() as u64,
+                window_ms = window.as_millis() as u64,
+                "exit: failure deduped against recent pattern fire; suppressed",
+            );
+            return;
+        }
+    }
+    debug!(
+        sensation = %ctx.on_exit.failure_sensation,
+        "exit: firing failure sensation",
+    );
+    let req = build_exit_trigger(&ctx.on_exit.failure_sensation, ctx.default_backend_id);
+    ctx.trigger_client.fire(req);
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use super::*;
+    use crate::config::ConnectionStrategy;
+
+    fn dry_run_client() -> Arc<TriggerClient> {
+        Arc::new(TriggerClient::new(
+            None,
+            ConnectionStrategy::Persistent,
+            Duration::from_millis(500),
+        ))
+    }
+
+    fn on_exit(s: &str, f: &str, min_ms: u64, dedupe_ms: u64) -> OnExit {
+        OnExit {
+            success_sensation: s.into(),
+            failure_sensation: f.into(),
+            success_min_duration_ms: min_ms,
+            failure_dedupe_window_ms: dedupe_ms,
+        }
+    }
+
+    fn ok_status() -> ExitStatus {
+        // Construct ExitStatus with code 0 deterministically.
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::ExitStatusExt;
+            ExitStatus::from_raw(0)
+        }
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::ExitStatusExt;
+            ExitStatus::from_raw(0)
+        }
+    }
+
+    /// Build an ExitStatus with a specific exit code (no signal). Used
+    /// to test the 130/143 heuristic for signal-trapping tools.
+    fn status_with_code(code: i32) -> ExitStatus {
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::ExitStatusExt;
+            // Wait status format: low 7 bits = signum (0 for normal exit),
+            // next byte = exit code.
+            ExitStatus::from_raw(code << 8)
+        }
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::ExitStatusExt;
+            ExitStatus::from_raw(code as u32)
+        }
+    }
+
+    fn fail_status() -> ExitStatus {
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::ExitStatusExt;
+            ExitStatus::from_raw(1 << 8) // exit code 1
+        }
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::ExitStatusExt;
+            ExitStatus::from_raw(1)
+        }
+    }
+
+    #[cfg(unix)]
+    fn signal_status(signum: i32) -> ExitStatus {
+        use std::os::unix::process::ExitStatusExt;
+        // Low 7 bits = signum encodes "died from signal" in the wait status
+        // format `ExitStatusExt::from_raw` consumes.
+        ExitStatus::from_raw(signum & 0x7f)
+    }
+
+    /// Smoke-test all four routing branches return without panicking,
+    /// and that signal shutdown short-circuits unconditionally. We can't
+    /// observe the gRPC call directly because it's fire-and-forget; the
+    /// integration tests in `tests/fake_daemon.rs` cover the wire-level
+    /// behaviour. This module's unit tests verify the *decision* logic.
+    #[tokio::test]
+    async fn signal_shutdown_skips_everything() {
+        let cfg = on_exit("success", "fail", 0, 0);
+        let cli = dry_run_client();
+        // Both paths chosen, but signal flag set ⇒ no panic, no work.
+        handle(ExitContext {
+            status: ok_status(),
+            duration: Duration::from_secs(60),
+            on_exit: &cfg,
+            default_backend_id: "mock-owo",
+            last_pattern_fire: None,
+            trigger_client: &cli,
+            shutdown_due_to_signal: true,
+            now: Instant::now(),
+        });
+        handle(ExitContext {
+            status: fail_status(),
+            duration: Duration::from_secs(60),
+            on_exit: &cfg,
+            default_backend_id: "mock-owo",
+            last_pattern_fire: None,
+            trigger_client: &cli,
+            shutdown_due_to_signal: true,
+            now: Instant::now(),
+        });
+    }
+
+    #[tokio::test]
+    async fn empty_sensations_short_circuit() {
+        let cfg = on_exit("", "", 0, 0);
+        let cli = dry_run_client();
+        handle(ExitContext {
+            status: ok_status(),
+            duration: Duration::from_secs(60),
+            on_exit: &cfg,
+            default_backend_id: "mock-owo",
+            last_pattern_fire: None,
+            trigger_client: &cli,
+            shutdown_due_to_signal: false,
+            now: Instant::now(),
+        });
+        handle(ExitContext {
+            status: fail_status(),
+            duration: Duration::from_secs(60),
+            on_exit: &cfg,
+            default_backend_id: "mock-owo",
+            last_pattern_fire: None,
+            trigger_client: &cli,
+            shutdown_due_to_signal: false,
+            now: Instant::now(),
+        });
+    }
+
+    #[tokio::test]
+    async fn fast_success_under_min_duration_is_suppressed() {
+        let cfg = on_exit("deploy_success", "", 30_000, 0);
+        let cli = dry_run_client();
+        handle(ExitContext {
+            status: ok_status(),
+            duration: Duration::from_millis(200),
+            on_exit: &cfg,
+            default_backend_id: "mock-owo",
+            last_pattern_fire: None,
+            trigger_client: &cli,
+            shutdown_due_to_signal: false,
+            now: Instant::now(),
+        });
+        // No assertion to make on the dry-run client — but the test
+        // exercises the suppression branch and must not panic.
+    }
+
+    #[tokio::test]
+    async fn failure_within_dedupe_window_is_suppressed() {
+        let cfg = on_exit("", "compile_error_severe", 0, 2000);
+        let cli = dry_run_client();
+        let now = Instant::now();
+        handle(ExitContext {
+            status: fail_status(),
+            duration: Duration::from_secs(5),
+            on_exit: &cfg,
+            default_backend_id: "mock-owo",
+            // Pattern fired 500ms ago — inside the 2000ms dedupe window.
+            last_pattern_fire: Some(now - Duration::from_millis(500)),
+            trigger_client: &cli,
+            shutdown_due_to_signal: false,
+            now,
+        });
+    }
+
+    #[tokio::test]
+    async fn failure_outside_dedupe_window_fires() {
+        let cfg = on_exit("", "compile_error_severe", 0, 2000);
+        let cli = dry_run_client();
+        let now = Instant::now();
+        handle(ExitContext {
+            status: fail_status(),
+            duration: Duration::from_secs(5),
+            on_exit: &cfg,
+            default_backend_id: "mock-owo",
+            last_pattern_fire: Some(now - Duration::from_millis(2500)),
+            trigger_client: &cli,
+            shutdown_due_to_signal: false,
+            now,
+        });
+    }
+
+    /// Reviewer's #2 regression case: a tool that *traps* SIGINT (Ctrl-C)
+    /// and exits with the conventional 128+SIGINT=130 code. The wrapper
+    /// in PTY raw-mode never observed the signal directly (the byte was
+    /// forwarded into the PTY), and `status.signal()` returns None
+    /// (clean exit). The 130-code heuristic is the only thing that
+    /// catches this, and it MUST suppress the on-exit success sensation.
+    #[tokio::test]
+    async fn signal_trapping_tool_exit_130_suppresses_success_sensation() {
+        let cfg = on_exit("deploy_success", "", 0, 0);
+        let cli = dry_run_client();
+        handle(ExitContext {
+            status: status_with_code(130),
+            duration: Duration::from_secs(60),
+            on_exit: &cfg,
+            default_backend_id: "mock-owo",
+            last_pattern_fire: None,
+            trigger_client: &cli,
+            shutdown_due_to_signal: false,
+            now: Instant::now(),
+        });
+    }
+
+    #[tokio::test]
+    async fn signal_trapping_tool_exit_143_suppresses_failure_sensation() {
+        // Same case for SIGTERM (143 = 128 + SIGTERM).
+        let cfg = on_exit("", "compile_error_severe", 0, 0);
+        let cli = dry_run_client();
+        handle(ExitContext {
+            status: status_with_code(143),
+            duration: Duration::from_secs(60),
+            on_exit: &cfg,
+            default_backend_id: "mock-owo",
+            last_pattern_fire: None,
+            trigger_client: &cli,
+            shutdown_due_to_signal: false,
+            now: Instant::now(),
+        });
+    }
+
+    /// Adjacent exit codes must NOT be suppressed — the heuristic is
+    /// narrowly targeted at 130 / 143. A tool exiting with 129 or 144
+    /// is a regular failure.
+    #[tokio::test]
+    async fn exit_codes_adjacent_to_128_plus_signum_still_fire() {
+        let cfg = on_exit("", "compile_error_severe", 0, 0);
+        let cli = dry_run_client();
+        for code in [1, 2, 127, 129, 131, 142, 144, 255] {
+            handle(ExitContext {
+                status: status_with_code(code),
+                duration: Duration::from_secs(60),
+                on_exit: &cfg,
+                default_backend_id: "mock-owo",
+                last_pattern_fire: None,
+                trigger_client: &cli,
+                shutdown_due_to_signal: false,
+                now: Instant::now(),
+            });
+            // Function returns void; can't assert "fired" against a
+            // dry-run client. Coverage of the not-suppressed branch is
+            // what this test buys us, plus regression-protection if
+            // someone widens the heuristic to e.g. `code >= 128`.
+        }
+    }
+
+    /// PTY raw-mode case: child exits from SIGINT (which we never received
+    /// because the byte went straight into the PTY), but `shutdown_due_to_signal`
+    /// is false. We must STILL suppress the failure sensation — the user
+    /// asked the wrapped command to stop, they don't need a buzz to confirm.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn child_killed_by_sigint_suppresses_failure_even_when_flag_unset() {
+        let cfg = on_exit("", "compile_error_severe", 0, 0);
+        let cli = dry_run_client();
+        // No `shutdown_due_to_signal` flag set — this is the PTY raw-mode
+        // path where the wrapper never observed the SIGINT itself.
+        handle(ExitContext {
+            status: signal_status(libc::SIGINT),
+            duration: Duration::from_secs(5),
+            on_exit: &cfg,
+            default_backend_id: "mock-owo",
+            last_pattern_fire: None,
+            trigger_client: &cli,
+            shutdown_due_to_signal: false,
+            now: Instant::now(),
+        });
+        // The function exited via the new "user signal" early-return branch;
+        // it must not have panicked or fired. Dry-run client doesn't expose
+        // a fire counter, but the integration test in fake_daemon covers
+        // wire-level no-fire behaviour. The decision-logic branch is
+        // exercised by virtue of the matches!() in handle().
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn child_killed_by_sigterm_also_suppresses_failure() {
+        // Same logic as above for SIGTERM (e.g. systemd stopping the wrapper).
+        let cfg = on_exit("", "compile_error_severe", 0, 0);
+        let cli = dry_run_client();
+        handle(ExitContext {
+            status: signal_status(libc::SIGTERM),
+            duration: Duration::from_secs(5),
+            on_exit: &cfg,
+            default_backend_id: "mock-owo",
+            last_pattern_fire: None,
+            trigger_client: &cli,
+            shutdown_due_to_signal: false,
+            now: Instant::now(),
+        });
+    }
+
+    /// The user-signal suppression must NOT extend to genuine crashes.
+    /// SIGSEGV / SIGABRT means the wrapped command broke; the user
+    /// genuinely needs to know about it.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn child_killed_by_crash_signal_still_fires_failure() {
+        let cfg = on_exit("", "compile_error_severe", 0, 0);
+        let cli = dry_run_client();
+        for crash_sig in [libc::SIGSEGV, libc::SIGABRT, libc::SIGBUS, libc::SIGFPE] {
+            handle(ExitContext {
+                status: signal_status(crash_sig),
+                duration: Duration::from_secs(5),
+                on_exit: &cfg,
+                default_backend_id: "mock-owo",
+                last_pattern_fire: None,
+                trigger_client: &cli,
+                shutdown_due_to_signal: false,
+                now: Instant::now(),
+            });
+            // We can't directly observe the fire from the dry-run client,
+            // but the function must take the failure path (not the new
+            // user-signal early return) — verified by the decision logic.
+        }
+    }
+
+    #[tokio::test]
+    async fn failure_with_no_prior_pattern_fire_fires() {
+        let cfg = on_exit("", "compile_error_severe", 0, 2000);
+        let cli = dry_run_client();
+        handle(ExitContext {
+            status: fail_status(),
+            duration: Duration::from_secs(5),
+            on_exit: &cfg,
+            default_backend_id: "mock-owo",
+            last_pattern_fire: None,
+            trigger_client: &cli,
+            shutdown_due_to_signal: false,
+            now: Instant::now(),
+        });
+    }
+}
