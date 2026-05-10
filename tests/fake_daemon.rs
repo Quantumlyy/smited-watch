@@ -433,7 +433,17 @@ async fn no_triggers_fire_after_grace_window_for_backgrounded_descendants() {
     // Pattern-only config: the on-exit branches are disabled so the
     // assertion "no triggers fired" only catches the late-pattern case
     // we're actually testing.
-    let (_dir, cfg) = write_pattern_only_config(&addr.to_string());
+    let (dir, cfg) = write_pattern_only_config(&addr.to_string());
+
+    // Write the backgrounded subshell's PID to a file so cleanup can
+    // target that specific PID instead of using `pkill -f` (which
+    // would also match unrelated `sleep 0.5` processes from concurrent
+    // tests or from a developer's other terminals).
+    let pid_file = dir.path().join("subshell.pid");
+    let script = format!(
+        r#"(sleep 0.5; echo "error TS9999") & echo $! > {}; exit 0"#,
+        pid_file.display()
+    );
 
     let cfg_owned = cfg.clone();
     let exit = tokio::task::spawn_blocking(move || {
@@ -442,12 +452,7 @@ async fn no_triggers_fire_after_grace_window_for_backgrounded_descendants() {
         // a TS-error line. The wrapper has long since aborted its
         // scanner and tee tasks — the late line should be swallowed by
         // the kernel pipe buffer with no live reader to scan it.
-        run_binary_with(
-            false,
-            false,
-            &cfg_owned,
-            r#"(sleep 0.5; echo "error TS9999") & exit 0"#,
-        )
+        run_binary_with(false, false, &cfg_owned, &script)
     })
     .await
     .unwrap();
@@ -474,11 +479,17 @@ async fn no_triggers_fire_after_grace_window_for_backgrounded_descendants() {
             .collect::<Vec<_>>()
     );
 
-    // Belt-and-braces cleanup so a regression doesn't leave the
-    // descendant chain running for the next test.
-    let _ = std::process::Command::new("pkill")
-        .args(["-f", "sleep 0.5"])
-        .status();
+    // Cleanup: kill the specific subshell PID we spawned (which in turn
+    // takes its `sleep 0.5` child with it via the same pgrp). Best-effort
+    // — by the time the assertion ran the descendant has likely already
+    // finished its 500ms sleep and exited on its own.
+    if let Ok(s) = std::fs::read_to_string(&pid_file) {
+        if let Ok(pid) = s.trim().parse::<i32>() {
+            unsafe {
+                libc::kill(pid as libc::pid_t, libc::SIGKILL);
+            }
+        }
+    }
 
     let _ = shutdown.send(());
 }

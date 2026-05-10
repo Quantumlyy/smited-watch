@@ -404,13 +404,20 @@ fn backgrounded_descendant_does_not_keep_wrapper_alive() {
     // descendant) until sleep finished naturally. Post-fix the wrapper
     // gives tee tasks a 100ms grace window then aborts, returning with
     // bash's exit code (0).
-    let (_dir, cfg) = empty_config();
+    let (dir, cfg) = empty_config();
+    let pid_file = dir.path().join("sleep.pid");
+    // Have bash write the backgrounded sleep's PID to a file so we can
+    // kill that *specific* PID at cleanup. `pkill -f "sleep 60"` would
+    // also match unrelated `sleep 60` processes from other tests in the
+    // same file (concurrent cargo-test runs) or from a developer's other
+    // terminals — friendly fire that masks regressions.
+    let script = format!("sleep 60 & echo $! > {}; exit 0", pid_file.display());
     let started = std::time::Instant::now();
     let out = binary(&cfg)
         .arg("--")
         .arg("bash")
         .arg("-c")
-        .arg("sleep 60 & exit 0")
+        .arg(&script)
         .output()
         .expect("run smited-watch");
     let elapsed = started.elapsed();
@@ -429,12 +436,17 @@ fn backgrounded_descendant_does_not_keep_wrapper_alive() {
         out.status
     );
 
-    // Belt-and-braces: don't leave the descendant sleep running for the
-    // next minute. We don't have its PID but `pkill -f` is reasonable
-    // for a self-contained test cleanup. Best-effort, don't assert.
-    let _ = std::process::Command::new("pkill")
-        .args(["-f", "sleep 60"])
-        .status();
+    // Cleanup: kill the specific PID we spawned, not every "sleep 60"
+    // on the system. Best-effort — if the file wasn't written for some
+    // reason (rare race), we don't assert.
+    #[cfg(unix)]
+    if let Ok(s) = std::fs::read_to_string(&pid_file) {
+        if let Ok(pid) = s.trim().parse::<i32>() {
+            unsafe {
+                libc::kill(pid as libc::pid_t, libc::SIGKILL);
+            }
+        }
+    }
 }
 
 #[test]
