@@ -4,10 +4,15 @@
 //!
 //! [`TriggerClient::fire`] never blocks the caller, never returns an error,
 //! and never panics. The trigger call is dispatched on a background tokio
-//! task; any failure (connect refused, timeout, gRPC error) is recorded at
-//! `debug` level and otherwise discarded. The wrapped command must keep
-//! running and exit with its real exit code regardless of daemon health —
-//! the watcher is best-effort.
+//! task via [`tokio::runtime::Handle::try_current`]; any failure (connect
+//! refused, timeout, gRPC error) is recorded at `debug` level and otherwise
+//! discarded. The wrapped command must keep running and exit with its real
+//! exit code regardless of daemon health — the watcher is best-effort.
+//!
+//! If `fire` is called from outside a tokio runtime (only possible for
+//! library users — the binary always invokes it from inside its runtime),
+//! the trigger is logged at `warn` level and dropped, rather than the bare
+//! `tokio::spawn` panic that would otherwise occur.
 //!
 //! ## No-op-on-failure guarantee
 //!
@@ -90,9 +95,24 @@ impl TriggerClient {
 
     /// Dispatch a trigger. Returns immediately; the actual gRPC call runs
     /// on a background task. See module-level docs for failure semantics.
+    ///
+    /// Spawns via [`tokio::runtime::Handle::try_current`] rather than the
+    /// bare `tokio::spawn` so library callers using this type from a
+    /// non-tokio context (or before their runtime is constructed) get a
+    /// debug log line instead of a panic. The wrapper binary always
+    /// invokes `fire` from inside its tokio runtime, so the no-runtime
+    /// branch is purely defensive.
     pub fn fire(&self, req: TriggerRequest) {
         let inner = self.inner.clone();
-        let handle = tokio::spawn(async move {
+        let Ok(rt) = tokio::runtime::Handle::try_current() else {
+            // Honour the "never panics" contract: log + drop the trigger
+            // silently rather than panicking. Real users will see this in
+            // their logs if they accidentally call `fire` outside a
+            // runtime; the binary never hits this path.
+            warn!("TriggerClient::fire called outside a tokio runtime; dropping trigger");
+            return;
+        };
+        let handle = rt.spawn(async move {
             inner.fire_inner(req).await;
         });
         // Best-effort task tracking. If the mutex is poisoned (impossible in
@@ -377,6 +397,39 @@ mod tests {
         assert!(
             abort_handle.is_finished(),
             "drain failed to abort the timed-out task"
+        );
+    }
+
+    /// PR review: `TriggerClient::fire` is documented as "never panics",
+    /// but a bare `tokio::spawn` panics if called outside a running
+    /// runtime. The fix routes through `Handle::try_current`; on `Err`
+    /// the trigger is logged + dropped instead. This test calls `fire`
+    /// from a plain `#[test]` function (NO tokio runtime) and asserts
+    /// it doesn't panic.
+    ///
+    /// Library users could plausibly construct a `TriggerClient` and
+    /// call `fire` from a non-async context (e.g. a sync error handler
+    /// that fires a "this thing crashed" sensation); the binary never
+    /// hits this path because main always wraps the work in
+    /// `runtime.block_on(…)`.
+    #[test]
+    fn fire_outside_tokio_runtime_does_not_panic() {
+        let client = TriggerClient::new(
+            None,
+            ConnectionStrategy::Persistent,
+            Duration::from_millis(500),
+        );
+        // No runtime in scope. With the bug present, the bare
+        // `tokio::spawn` inside `fire` would panic with
+        // "there is no reactor running, must be called from the context
+        //  of a Tokio 1.x runtime".
+        client.fire(dry_req());
+        // Inner state untouched — handle was never spawned, so nothing
+        // got pushed into in_flight. Confirms the no-runtime branch.
+        assert_eq!(
+            client.inner.in_flight.lock().unwrap().len(),
+            0,
+            "no handle should be tracked when fire is called outside a runtime"
         );
     }
 
