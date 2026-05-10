@@ -2,6 +2,7 @@
 
 pub mod config;
 pub mod debounce;
+pub mod scan;
 
 pub mod proto {
     pub mod smited {
