@@ -193,20 +193,36 @@ pub fn install_handlers(
 pub fn forward_signal(target: SignalTarget, signum: i32) {
     match target {
         SignalTarget::Pid(pid) => {
-            // Suppress only SIGINT — the terminal has already delivered
-            // it to both us and the child via the foreground pgrp.
-            // SIGTERM/SIGHUP/SIGPIPE etc. only reach us when something
-            // explicitly targets the wrapper's PID, so the child needs
-            // an explicit forward or it'll be orphaned.
+            // SIGINT in the shared-pgrp case is the tricky one: we
+            // can't tell at this layer whether the kernel already
+            // delivered it to the child (terminal Ctrl-C path) or not
+            // (`kill -INT <wrapper_pid>` path). Forwarding immediately
+            // duplicates it for terminal Ctrl-C → escalation tools
+            // hard-abort. NOT forwarding leaves the wrapper stuck on
+            // child.wait() if the kernel never delivered to the child.
+            //
+            // Compromise: schedule a delayed forward. The grace window
+            // (~150 ms) covers the terminal-Ctrl-C path — the child
+            // will normally have started exiting by then. We probe
+            // liveness via kill(pid, 0) before forwarding, so:
+            //
+            //   - terminal Ctrl-C: child died, kill(0) returns -1, no
+            //     forward. No double SIGINT.
+            //   - external `kill -INT <wrapper_pid>`: child is still
+            //     alive at +150 ms, we send SIGINT — wrapper unblocks.
+            //
+            // PID reuse is theoretically possible inside the 150 ms
+            // window but vanishingly rare on modern systems. The
+            // alternative (wrapper hanging forever on supervisor-driven
+            // SIGINT) is worse.
             if signum == libc::SIGINT {
-                debug!(
-                    pid,
-                    signum,
-                    "smited-watch: skipping SIGINT forward — terminal already \
-                     delivered it to the shared pgrp"
-                );
+                schedule_delayed_pid_sigint(pid);
                 return;
             }
+            // SIGTERM/SIGHUP/SIGPIPE: forward immediately. These don't
+            // come from terminal foreground-pgrp delivery; only an
+            // explicit `kill -SIG <wrapper_pid>` reaches us, and the
+            // child needs the explicit forward or it'll be orphaned.
             debug!(
                 pid,
                 signum,
@@ -227,6 +243,55 @@ pub fn forward_signal(target: SignalTarget, signum: i32) {
             }
         }
     }
+}
+
+/// Grace window for the kernel's terminal-Ctrl-C delivery to reach the
+/// child. Tuned: short enough that supervisor-driven `kill -INT` feels
+/// responsive; long enough to absorb the typical latency between SIGINT
+/// arrival and a tool's signal handler completing.
+#[cfg(unix)]
+const PID_SIGINT_DELAY: std::time::Duration = std::time::Duration::from_millis(150);
+
+/// Spawn a tokio task that, after [`PID_SIGINT_DELAY`], probes the child
+/// for liveness and forwards SIGINT only if it's still alive. No-op
+/// (with a debug log) if called outside a tokio runtime — that path
+/// exists for testability and for any hypothetical library use; the
+/// binary always runs this from a tokio context.
+#[cfg(unix)]
+fn schedule_delayed_pid_sigint(pid: u32) {
+    let pid_t = pid as libc::pid_t;
+    let Ok(handle) = tokio::runtime::Handle::try_current() else {
+        debug!(
+            pid,
+            "smited-watch: forward_signal called outside tokio runtime; \
+             cannot schedule delayed SIGINT (test or library use)"
+        );
+        return;
+    };
+    handle.spawn(async move {
+        tokio::time::sleep(PID_SIGINT_DELAY).await;
+        // SAFETY: kill(pid, 0) is async-signal-safe, returns -1 on
+        // error rather than UB. signum=0 sends no signal — pure
+        // liveness probe.
+        let alive = unsafe { libc::kill(pid_t, 0) } == 0;
+        if alive {
+            debug!(
+                pid = pid_t as u32,
+                "smited-watch: delayed SIGINT — child still alive after grace, \
+                 forwarding (probably external `kill -INT <wrapper_pid>`)"
+            );
+            // SAFETY: same as above; ESRCH on a since-departed PID is fine.
+            unsafe {
+                libc::kill(pid_t, libc::SIGINT);
+            }
+        } else {
+            debug!(
+                pid = pid_t as u32,
+                "smited-watch: delayed SIGINT — child died during grace \
+                 (terminal Ctrl-C path); no forward needed"
+            );
+        }
+    });
 }
 
 /// Windows: best-effort. There's no equivalent of "forward this exact
@@ -312,13 +377,20 @@ mod tests {
         let _ = child.wait();
     }
 
-    /// The bug fix: `forward_signal(Pid(_), SIGINT)` must NOT actually
-    /// deliver SIGINT. The Pid case implies the child is in our pgrp,
-    /// so the kernel already delivered the terminal signal — a forward
-    /// would be a duplicate, and tools like npm/cargo treat the second
-    /// SIGINT as "user really means it" and hard-abort.
+    /// `forward_signal(Pid(_), SIGINT)` must NOT deliver SIGINT
+    /// *immediately* — the terminal-Ctrl-C path has the kernel
+    /// delivering it to both wrapper and child, and an immediate
+    /// forward duplicates it; npm/cargo escalate on the second SIGINT
+    /// and hard-abort.
+    ///
+    /// The function may schedule a delayed forward via tokio (covered
+    /// by `forward_signal_pid_sigint_delayed_forward_runs_after_grace`
+    /// below), but this sync test confirms the immediate path stays
+    /// silent. We don't have a tokio runtime here, so the delayed
+    /// forward path never even schedules — exactly the no-runtime
+    /// fallback documented on `schedule_delayed_pid_sigint`.
     #[test]
-    fn forward_signal_pid_target_does_not_signal_the_child() {
+    fn forward_signal_pid_target_does_not_signal_the_child_immediately() {
         let mut child = Command::new("sleep")
             .arg("30")
             .spawn()
@@ -326,19 +398,109 @@ mod tests {
         let pid = child.id();
         assert!(process_alive(pid), "sleep should be alive after spawn");
 
-        // The call under test. If forward_signal were to send SIGINT,
-        // the default-action sleep would die.
         forward_signal(SignalTarget::Pid(pid), libc::SIGINT);
 
-        std::thread::sleep(Duration::from_millis(100));
+        // Wait less than the 150ms grace, so even if a runtime were
+        // somehow available the delayed task wouldn't have fired.
+        std::thread::sleep(Duration::from_millis(50));
         let alive = process_alive(pid);
         cleanup(&mut child);
         assert!(
             alive,
-            "forward_signal(Pid, SIGINT) must NOT signal the child — \
+            "forward_signal(Pid, SIGINT) must NOT immediately signal the child — \
              that would be a duplicate of the kernel's foreground-pgrp \
-             delivery in the scenario this branch exists for"
+             delivery in the terminal Ctrl-C scenario"
         );
+    }
+
+    /// The other half of the SIGINT-in-Pid-case design: an *external*
+    /// `kill -INT <wrapper_pid>` (e.g. from a supervisor) only targets
+    /// the wrapper PID — the kernel does NOT propagate to the child.
+    /// If we just no-oped SIGINT the wrapper would be stuck on
+    /// `child.wait()` forever. The delayed-forward escape hatch
+    /// schedules a SIGINT for the child after a grace window, so
+    /// supervisor-initiated shutdown still works.
+    ///
+    /// This test runs inside a tokio runtime so the delayed forward
+    /// can actually schedule, and uses `try_wait()` to detect the
+    /// child's exit (NOT `kill(pid, 0)` — that returns 0 for zombies
+    /// too, so it'd report a SIGINT'd-but-not-yet-reaped child as
+    /// "alive").
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn forward_signal_pid_sigint_delayed_forward_runs_after_grace() {
+        let mut child = tokio::task::spawn_blocking(|| {
+            Command::new("sleep")
+                .arg("30")
+                .spawn()
+                .expect("spawn sleep")
+        })
+        .await
+        .unwrap();
+        let pid = child.id();
+
+        forward_signal(SignalTarget::Pid(pid), libc::SIGINT);
+
+        // Wait past the 150ms grace + generous CI margin. The delayed
+        // task should have fired and SIGINT'd the child by now (default
+        // action: terminate). Reap it via try_wait — if the wait
+        // returns an exit status with signal=SIGINT, our forward
+        // worked.
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        let exit = child.try_wait().expect("try_wait should not error");
+        if exit.is_none() {
+            // Regression: child still running. Clean up before failing.
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!(
+                "forward_signal(Pid, SIGINT) must schedule a delayed forward so \
+                 external `kill -INT <wrapper_pid>` reaches the child — without \
+                 this, the wrapper would be stuck on child.wait() forever"
+            );
+        }
+        use std::os::unix::process::ExitStatusExt;
+        let status = exit.unwrap();
+        assert_eq!(
+            status.signal(),
+            Some(libc::SIGINT),
+            "child should have died from the delayed SIGINT forward; \
+             got status {status:?}"
+        );
+    }
+
+    /// In the terminal-Ctrl-C path the child dies on its own from the
+    /// kernel-delivered SIGINT *during* the grace window, and the
+    /// wrapper's own `child.wait()` reaps the zombie. The delayed
+    /// forward then observes `kill(pid, 0) == -1` and skips. Simulate
+    /// this by killing+reaping ourselves before the grace elapses.
+    /// We can't directly observe "no signal sent" (would require
+    /// racing PID reuse), so this test mainly exercises the dead-PID
+    /// branch of the delayed task and confirms it doesn't panic.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn forward_signal_pid_sigint_delayed_forward_skips_dead_child() {
+        let mut child = tokio::task::spawn_blocking(|| {
+            Command::new("sleep")
+                .arg("30")
+                .spawn()
+                .expect("spawn sleep")
+        })
+        .await
+        .unwrap();
+        let pid = child.id();
+
+        forward_signal(SignalTarget::Pid(pid), libc::SIGINT);
+        // Simulate the kernel-delivered terminal-Ctrl-C path: child
+        // dies and is reaped by the wrapper's own wait() during grace.
+        let _ = child.kill();
+        let _ = child.wait();
+        // Now kill(pid, 0) returns -1 (ESRCH) — the PID has been freed.
+        assert!(
+            !process_alive(pid),
+            "child should be reaped and PID freed before grace elapses"
+        );
+
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        // The delayed task ran, saw kill(pid, 0) == -1, skipped the
+        // forward. No assertion needed beyond "no panic".
     }
 
     /// SIGTERM in the Pid case MUST still forward. Unlike SIGINT (which
