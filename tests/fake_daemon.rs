@@ -168,6 +168,42 @@ failure_dedupe_window_ms = 2000
     (dir, path)
 }
 
+/// Variant with patterns active but BOTH on-exit sensations disabled.
+/// Lets a test isolate "did a pattern fire?" from "did on-exit fire?"
+/// without having to filter out the latter from the captured set.
+fn write_pattern_only_config(host: &str) -> (TempDir, std::path::PathBuf) {
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("watch.toml");
+    std::fs::write(
+        &path,
+        format!(
+            r#"
+[smited]
+host = "{host}"
+backend_id = "mock-owo"
+
+[smited.connection]
+timeout_ms = 1500
+strategy = "per_trigger"
+
+[[patterns]]
+name = "ts"
+regex = 'error TS\d+'
+sensation = "compile_error_mild"
+debounce_ms = 0
+
+[on_exit]
+success_sensation = ""
+failure_sensation = ""
+success_min_duration_ms = 30000
+failure_dedupe_window_ms = 2000
+"#
+        ),
+    )
+    .unwrap();
+    (dir, path)
+}
+
 /// Variant with a `failure_sensation` set so we can verify the on-exit
 /// failure path (and its suppression branches) at the wire level.
 fn write_failure_config(host: &str) -> (TempDir, std::path::PathBuf) {
@@ -379,6 +415,70 @@ async fn child_killed_by_sigint_does_not_fire_failure_sensation() {
             })
             .collect::<Vec<_>>()
     );
+
+    let _ = shutdown.send(());
+}
+
+/// Wire-level proof of the second half of fix-#1: when a backgrounded
+/// descendant emits a pattern-matching line *after* the immediate child
+/// has already exited, no trigger should fire — the wrapper has aborted
+/// its scanner and tee tasks within the grace window. Pre-fix the tee
+/// tasks (and scanner consumer) were detached on timeout rather than
+/// aborted, so they kept processing and the late pattern match would
+/// still reach the daemon.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn no_triggers_fire_after_grace_window_for_backgrounded_descendants() {
+    let (addr, captured, shutdown) = spawn_fake_daemon().await;
+    // Pattern-only config: the on-exit branches are disabled so the
+    // assertion "no triggers fired" only catches the late-pattern case
+    // we're actually testing.
+    let (_dir, cfg) = write_pattern_only_config(&addr.to_string());
+
+    let cfg_owned = cfg.clone();
+    let exit = tokio::task::spawn_blocking(move || {
+        // Bash exits immediately (code 0). The descendant, with bash's
+        // stdout/stderr inherited, sleeps half a second and *then* emits
+        // a TS-error line. The wrapper has long since aborted its
+        // scanner and tee tasks — the late line should be swallowed by
+        // the kernel pipe buffer with no live reader to scan it.
+        run_binary_with(
+            false,
+            false,
+            &cfg_owned,
+            r#"(sleep 0.5; echo "error TS9999") & exit 0"#,
+        )
+    })
+    .await
+    .unwrap();
+
+    // Wait long enough that *if* the bug were back, the late echo would
+    // have happened (500ms) and the trigger would have arrived (a few
+    // hundred ms more). 1.5s is generous.
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+
+    let received = captured.lock().await;
+    assert_eq!(exit, 0, "bash exited 0; wrapper should propagate that");
+    assert!(
+        received.is_empty(),
+        "no triggers should fire after the wrapper exited; got {} request(s): {:?}",
+        received.len(),
+        received
+            .iter()
+            .filter_map(|r| match &r.sensation {
+                Some(
+                    smited_watch::proto::smited::v1::trigger_request::Sensation::SensationName(n),
+                ) => Some(n.clone()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+    );
+
+    // Belt-and-braces cleanup so a regression doesn't leave the
+    // descendant chain running for the next test.
+    let _ = std::process::Command::new("pkill")
+        .args(["-f", "sleep 0.5"])
+        .status();
 
     let _ = shutdown.send(());
 }

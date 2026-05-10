@@ -201,23 +201,31 @@ pub async fn run(opts: WrapOptions) -> Result<ExitStatus> {
     // longer for: `bash -c 'sleep 60 & exit 0'` should exit promptly
     // with bash's exit code, not hang for 60 seconds waiting for sleep.
     let grace = Duration::from_millis(100);
+
+    // Snapshot abort handles for every tee task BEFORE moving the
+    // JoinHandles into the join_all future. tokio::time::timeout
+    // consumes the JoinHandle on Err(Elapsed) and drops it — and
+    // dropping a JoinHandle does NOT cancel the underlying task. The
+    // tee task would then keep running on the executor, still holding
+    // its scan_tx clone (which keeps the scanner channel alive) and
+    // its read end (which keeps reading from the child's pipe).
+    // Capturing abort handles up front lets us actually cancel them.
+    let tee_aborts: Vec<tokio::task::AbortHandle> =
+        tee_tasks.iter().map(|t| t.abort_handle()).collect();
     let join_all = async {
         for t in tee_tasks {
             let _ = t.await;
         }
     };
     if tokio::time::timeout(grace, join_all).await.is_err() {
+        for abort in &tee_aborts {
+            abort.abort();
+        }
         debug!(
             grace_ms = grace.as_millis() as u64,
             "wrap: tee tasks didn't drain within grace window — likely a \
-             backgrounded descendant holding stdout/stderr open; aborting"
+             backgrounded descendant holding stdout/stderr open; aborted"
         );
-        // Tee tasks are still alive (blocked on reader recv). The
-        // reader handles they hold are dropped at await-point return,
-        // which closes our read end of the child's pipes — descendants
-        // get EPIPE on their next write. Signal-handler forwarding
-        // doesn't apply here (the immediate child has already exited
-        // with its own status, which we'll propagate as recorded).
     }
     // Reap blocking reader threads. In normal exit they've already
     // returned (EOF). When a backgrounded descendant kept the pipe
@@ -229,15 +237,20 @@ pub async fn run(opts: WrapOptions) -> Result<ExitStatus> {
     // We don't join it — the process will exit shortly.
     drop(stdin_thread);
 
-    // Wait for the scan consumer to drain every queued chunk *first*. Only
-    // after `scan_consumer.await` returns is the scanner's internal buffer
-    // guaranteed to contain all bytes produced by the child — calling
-    // `scanner.flush()` earlier would emit a stale partial line and we'd
-    // never see the trailing one for commands that print a final line
-    // without a `\n`. Bound this with the same grace logic: if a tee
-    // task was aborted above, scan_tx clones it held are dropped, the
-    // channel closes, and the consumer terminates immediately.
-    let _ = tokio::time::timeout(grace, scan_consumer).await;
+    // Same JoinHandle-drop bug applies to the scanner consumer: if its
+    // grace timeout elapses (for example because a tee task was aborted
+    // above and didn't drop its scan_tx clone before the abort took
+    // effect), `tokio::time::timeout(_, scan_consumer)` would drop the
+    // handle without cancelling the task. Snapshot the abort handle
+    // first.
+    let scan_abort = scan_consumer.abort_handle();
+    if tokio::time::timeout(grace, scan_consumer).await.is_err() {
+        scan_abort.abort();
+        debug!(
+            grace_ms = grace.as_millis() as u64,
+            "wrap: scan consumer didn't drain within grace window; aborted"
+        );
+    }
 
     // Now flush trailing partial lines for every stream and dispatch.
     let final_events = scanner.flush_all();
