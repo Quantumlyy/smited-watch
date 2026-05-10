@@ -15,7 +15,8 @@
 [smited]
 # Daemon address as host:port. Leave commented out (or unset) to run in
 # dry-run mode — patterns still match and log, but no triggers are fired.
-host = "windows-rig.local:7777"
+# Uncomment and edit when you're ready to point the watcher at a real daemon.
+# host = "windows-rig.local:7777"
 
 # Default backend id to target. Per-pattern entries can override.
 backend_id = "mock-owo"

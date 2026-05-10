@@ -194,6 +194,26 @@ fn write_template_produces_a_valid_loadable_config() {
 }
 
 #[test]
+fn auto_created_template_is_dry_run_by_default() {
+    // First-run UX contract: writing the template and immediately loading
+    // it must produce a config with NO `host` set, so the watcher runs in
+    // dry-run mode rather than trying to contact the example daemon
+    // (`windows-rig.local:7777`) that the user almost certainly does not
+    // have on their network. The example value lives in the file as a
+    // commented-out hint instead.
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("watch.toml");
+    config::write_template(&path).expect("template should write");
+    let cfg = config::load(&path).expect("template should load");
+    assert!(
+        cfg.smited.host.is_none(),
+        "auto-created template must leave [smited].host unset so first run is dry-run; \
+         got host={:?}",
+        cfg.smited.host
+    );
+}
+
+#[test]
 fn known_strategy_strings_parse() {
     for (s, expect_per_trigger) in [("persistent", false), ("per_trigger", true)] {
         let (_dir, path) = write_temp(&format!(
