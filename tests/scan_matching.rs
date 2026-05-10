@@ -183,6 +183,46 @@ fn stdout_and_stderr_chunks_do_not_splice_into_one_logical_line() {
     );
 }
 
+/// The default test_failure pattern (in examples/wrap.toml + the
+/// patterns-cookbook entry) must NOT match a clean test summary like
+/// "0 failed, 12 passed", which is what every major runner prints on
+/// a green run. The leading `[1-9]\d*` (instead of `\d+`) is what
+/// keeps the regex narrowly targeted at *real* failure counts.
+#[test]
+fn test_failure_pattern_excludes_zero_count() {
+    let s = make_scanner(vec![pat(
+        "generic_test_failure",
+        r"(?i)[1-9]\d*\s+(failed|failing)",
+    )]);
+
+    // No-fire cases: clean test runs.
+    for clean in [
+        "Tests:       0 failed, 12 passed\n",
+        "0 failing\n",
+        "Tests: 0 failed\n",
+        "test result: ok. 5 passed; 0 failed; 0 ignored\n",
+    ] {
+        assert!(
+            s.feed(StreamId::Stdout, clean.as_bytes()).is_empty(),
+            "clean line {clean:?} must NOT match the test-failure pattern"
+        );
+    }
+
+    // Fire cases: actual failures.
+    for fail in [
+        "Tests:       1 failed, 11 passed\n",
+        "12 failing\n",
+        "Tests:       100 failed\n",
+    ] {
+        let events = s.feed(StreamId::Stdout, fail.as_bytes());
+        assert!(
+            !events.is_empty(),
+            "real failure {fail:?} should match the test-failure pattern"
+        );
+        assert_eq!(events[0].pattern_idx, 0);
+    }
+}
+
 /// Both streams have buffered partial lines on EOF; flush_all must drain
 /// each independently.
 #[test]

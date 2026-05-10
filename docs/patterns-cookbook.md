@@ -105,12 +105,17 @@ Pure shotgun pattern useful as a fallback for less-known runners.
 ```toml
 [[patterns]]
 name        = "generic_test_failure"
-regex       = '(?i)\b(\d+)\s+(failed|failing)\b'
+regex       = '(?i)\b[1-9]\d*\s+(failed|failing)\b'
 sensation   = "test_failed"
 debounce_ms = 2000
 ```
 
-Matches "1 failed", "12 failing", "FAILED 3", etc.
+Matches "1 failed", "12 failing", "100 failed", etc.
+
+> Note the leading `[1-9]\d*` rather than `\d+` — most test runners
+> print a pass summary like `0 failed, 12 passed` that we'd otherwise
+> match on a clean run. Apply the same trick to your own runner
+> patterns.
 
 ## ESLint
 

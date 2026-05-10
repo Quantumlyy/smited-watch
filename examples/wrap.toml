@@ -71,7 +71,7 @@ sensation = "compile_error_severe"
 
 [[patterns]]
 name = "test_failure"
-regex = '(?i)(\d+)\s+(failed|failing)'
+regex = '(?i)[1-9]\d*\s+(failed|failing)'
 sensation = "test_failed"
 debounce_ms = 1000
 
