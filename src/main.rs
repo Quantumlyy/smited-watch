@@ -1,9 +1,7 @@
-use std::process::ExitCode;
-
 use clap::Parser;
 use smited_watch::cli::{tracing_filter, Cli, DEFAULT_BACKEND_ID};
 
-fn main() -> ExitCode {
+fn main() -> ! {
     let cli = Cli::parse();
 
     // Tracing first, so config-resolution errors render through tracing.
@@ -14,7 +12,7 @@ fn main() -> ExitCode {
         let mut cmd = <Cli as clap::CommandFactory>::command();
         let _ = cmd.print_help();
         eprintln!();
-        return ExitCode::from(2);
+        std::process::exit(2);
     }
 
     // SMITED_WATCH_DISABLE=1 → pure passthrough.
@@ -29,7 +27,7 @@ fn main() -> ExitCode {
         Ok(rt) => rt,
         Err(e) => {
             eprintln!("[smited-watch] failed to start tokio runtime: {e}");
-            return ExitCode::from(1);
+            std::process::exit(1);
         }
     };
 
@@ -40,11 +38,19 @@ fn main() -> ExitCode {
         run_with_config(cli).await
     });
 
+    // We deliberately use `std::process::exit(i32)` rather than returning
+    // `std::process::ExitCode::from(u8)` so the wrapped command's full
+    // exit code propagates on Windows. Windows process exit codes are
+    // 32-bit (e.g. MSI installers commonly use 3010 to mean "reboot
+    // required"); truncating to a u8 would silently break the spec's
+    // "exit with the same exit code as the inner command" guarantee.
+    // On Unix the kernel masks to the low 8 bits regardless, so this
+    // is a no-op there.
     match exit_code {
-        Ok(code) => ExitCode::from(code as u8),
+        Ok(code) => std::process::exit(code),
         Err(e) => {
             eprintln!("[smited-watch] {e:#}");
-            ExitCode::from(1)
+            std::process::exit(1);
         }
     }
 }
