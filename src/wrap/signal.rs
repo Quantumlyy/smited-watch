@@ -147,6 +147,31 @@ pub fn install_handlers(
 /// Forward `signum` to the wrapped command, dispatching on whether the
 /// child is a pgrp leader (group target) or just a single PID.
 ///
+/// ## Why `Pid` is a no-op
+///
+/// `SignalTarget::Pid` is set only in the pipe-mode-with-TTY-stdin case,
+/// where we deliberately skip `process_group(0)` so the child can still
+/// read from the parent's controlling terminal without SIGTTIN. As a
+/// result, the child is in the *wrapper's* process group — which is also
+/// the foreground pgrp of the controlling terminal. A user Ctrl-C is
+/// therefore delivered to **both** wrapper and child by the kernel
+/// directly; if we *also* forwarded SIGINT here, the child would receive
+/// it twice. Tools that escalate on a second interrupt (npm, cargo,
+/// node, etc.) treat the second hit as "the user really means it" and
+/// hard-abort, skipping cleanup. So we no-op the `Pid` case and let the
+/// kernel's foreground-pgrp delivery do the work.
+///
+/// Tradeoff: a user running `kill -INT <wrapper_pid>` from another
+/// terminal (single-PID, no pgrp) would NOT reach the child this way.
+/// They can use `kill -INT -<wrapper_pgrp>` to signal the group, which
+/// both the wrapper and the child are in. The terminal Ctrl-C path,
+/// which is overwhelmingly the common case, works.
+///
+/// `SignalTarget::Pgrp` is set in PTY mode and in pipe mode with non-TTY
+/// stdin; in both, we *did* call `setpgid(0)`/`setsid` so the child has
+/// its own pgrp and the kernel does NOT propagate terminal signals to it
+/// for free. Forwarding via `kill(-pid, …)` is required.
+///
 /// SAFETY of `kill(2)`: async-signal-safe, returns `-1` on error rather
 /// than UB. We ignore the return value — if the group has already
 /// exited, ESRCH is fine.
@@ -154,10 +179,12 @@ pub fn install_handlers(
 pub fn forward_signal(target: SignalTarget, signum: i32) {
     match target {
         SignalTarget::Pid(pid) => {
-            debug!(pid, signum, "smited-watch: forwarding signal to child PID");
-            unsafe {
-                libc::kill(pid as libc::pid_t, signum);
-            }
+            debug!(
+                pid,
+                signum,
+                "smited-watch: skipping signal forward — child shares wrapper's pgrp; \
+                 terminal/pgrp signals already reach it"
+            );
         }
         SignalTarget::Pgrp(pid) => {
             debug!(
@@ -222,5 +249,121 @@ impl MasterPtyExt for MasterPtyHandle {
     fn resize_blocking(&self, size: PtySize) -> Result<()> {
         let guard = self.inner.lock().expect("master mutex poisoned");
         guard.resize(size).map_err(|e| anyhow::anyhow!(e))
+    }
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    //! Regression tests for the double-Ctrl-C bug.
+    //!
+    //! These spawn real `sleep` processes and observe their liveness via
+    //! `kill(pid, 0)` (which probes for a process without sending it a
+    //! signal). The unit tests here are deliberately small and
+    //! self-contained — easier to debug than the integration-level
+    //! "wrap a thing that escalates on a second SIGINT" alternative,
+    //! and they pin down `forward_signal`'s exact behaviour at the
+    //! API boundary so a future refactor can't accidentally re-enable
+    //! the duplicate forward.
+
+    use super::*;
+    use std::process::Command;
+    use std::time::Duration;
+
+    /// `kill(pid, 0)` returns 0 if the process exists, -1 (errno=ESRCH)
+    /// otherwise. No signal is delivered.
+    fn process_alive(pid: u32) -> bool {
+        unsafe { libc::kill(pid as libc::pid_t, 0) == 0 }
+    }
+
+    /// Reap a child to avoid leaving zombies if a test panics.
+    fn cleanup(child: &mut std::process::Child) {
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+
+    /// The bug fix: `forward_signal(Pid(_), SIGINT)` must NOT actually
+    /// deliver SIGINT. The Pid case implies the child is in our pgrp,
+    /// so the kernel already delivered the terminal signal — a forward
+    /// would be a duplicate, and tools like npm/cargo treat the second
+    /// SIGINT as "user really means it" and hard-abort.
+    #[test]
+    fn forward_signal_pid_target_does_not_signal_the_child() {
+        let mut child = Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .expect("spawn sleep");
+        let pid = child.id();
+        assert!(process_alive(pid), "sleep should be alive after spawn");
+
+        // The call under test. If forward_signal were to send SIGINT,
+        // the default-action sleep would die.
+        forward_signal(SignalTarget::Pid(pid), libc::SIGINT);
+
+        std::thread::sleep(Duration::from_millis(100));
+        let alive = process_alive(pid);
+        cleanup(&mut child);
+        assert!(
+            alive,
+            "forward_signal(Pid, SIGINT) must NOT signal the child — \
+             that would be a duplicate of the kernel's foreground-pgrp \
+             delivery in the scenario this branch exists for"
+        );
+    }
+
+    /// Symmetric guard: same call, different signal. The Pid case is a
+    /// no-op for *every* signal, not just SIGINT. Covers SIGTERM (which
+    /// is also delivered to the foreground pgrp by the kernel when the
+    /// terminal/user/init sends it via `kill(0, …)`).
+    #[test]
+    fn forward_signal_pid_target_does_not_signal_for_sigterm_either() {
+        let mut child = Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .expect("spawn sleep");
+        let pid = child.id();
+
+        forward_signal(SignalTarget::Pid(pid), libc::SIGTERM);
+
+        std::thread::sleep(Duration::from_millis(100));
+        let alive = process_alive(pid);
+        cleanup(&mut child);
+        assert!(
+            alive,
+            "forward_signal(Pid, _) must be a no-op regardless of signum"
+        );
+    }
+
+    /// Counterpart proof that `Pgrp` *does* still forward — without it,
+    /// the no-op-on-Pid fix would make the wrapper completely fail to
+    /// forward signals in PTY mode and pipe-mode-with-redirected-stdin,
+    /// which is the original feature the SignalTarget enum exists for.
+    /// Spawn `sleep` in its own pgrp so the test process isn't itself
+    /// signalled by `kill(-pgid, …)`.
+    #[test]
+    fn forward_signal_pgrp_target_does_signal_the_child_group() {
+        use std::os::unix::process::CommandExt;
+        use std::os::unix::process::ExitStatusExt;
+
+        let mut child = {
+            let mut c = Command::new("sleep");
+            c.arg("30");
+            // process_group(0) makes the child its own pgrp leader, so
+            // pgid == child.id(). Critical: without this, kill(-child_pid,
+            // …) would either ESRCH or — in the worst case — signal the
+            // test process itself.
+            c.process_group(0);
+            c.spawn().expect("spawn sleep with own pgrp")
+        };
+        let pid = child.id();
+        assert!(process_alive(pid));
+
+        forward_signal(SignalTarget::Pgrp(pid), libc::SIGTERM);
+
+        let status = child.wait().expect("wait on sleep");
+        assert_eq!(
+            status.signal(),
+            Some(libc::SIGTERM),
+            "Pgrp target must deliver the requested signal to the child group"
+        );
     }
 }
