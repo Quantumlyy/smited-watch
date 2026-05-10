@@ -1,0 +1,101 @@
+# smited-watch configuration.
+#
+# This is the file the watcher reads on startup. The default location is
+#   $XDG_CONFIG_HOME/smited/watch.toml   (Linux/macOS)
+#   %APPDATA%\smited\watch.toml          (Windows)
+# falling back to ~/.config/smited/watch.toml on Linux/macOS when XDG is
+# unset. Override with --config <path> or $SMITED_WATCH_CONFIG.
+#
+# Edit the [smited] host to point at your daemon, then add or tweak the
+# [[patterns]] entries to match the build output you care about.
+
+# ----------------------------------------------------------------------------
+# Daemon connection
+# ----------------------------------------------------------------------------
+[smited]
+# Daemon address as host:port. Leave commented out (or unset) to run in
+# dry-run mode — patterns still match and log, but no triggers are fired.
+host = "windows-rig.local:7777"
+
+# Default backend id to target. Per-pattern entries can override.
+backend_id = "mock-owo"
+
+[smited.connection]
+# Connect timeout per trigger attempt, in milliseconds. Triggers that take
+# longer are dropped silently. Default 500.
+timeout_ms = 500
+
+# "persistent" keeps one channel open for the watcher's lifetime; faster
+# but leaks state if the daemon restarts (the next trigger reconnects).
+# "per_trigger" opens a fresh channel per trigger; slower but stateless.
+# Default "persistent".
+strategy = "persistent"
+
+# ----------------------------------------------------------------------------
+# Patterns
+#
+# Each [[patterns]] entry watches for one regex in the wrapped command's
+# combined stdout/stderr stream and fires a sensation on match. Patterns
+# are anchored to a single line; ANSI colour codes are stripped before
+# matching but preserved in the passed-through stream.
+# ----------------------------------------------------------------------------
+[[patterns]]
+# Stable identifier; appears in logs and in the daemon's client_trace_id.
+name = "ts_error"
+
+# PCRE-ish regex (Rust's `regex` crate; no lookaround).
+regex = 'error TS\d+'
+
+# Sensation to fire on the smited daemon. Must already be registered on
+# the target backend.
+sensation = "compile_error_mild"
+
+# Optional backend override; falls back to [smited].backend_id.
+# backend_id = "owo-primary"
+
+# Debounce window in ms. Subsequent matches of the same pattern within the
+# window are dropped (not queued). Leading-edge firing. Default 500.
+debounce_ms = 500
+
+# Optional intensity scale 0..100. Falls back to the sensation's default.
+# intensity_scale = 75
+
+# Optional priority -1000..1000. Falls back to 0.
+# priority = 0
+
+[[patterns]]
+name = "vite_error"
+regex = '\[vite\].*error'
+sensation = "compile_error_severe"
+
+[[patterns]]
+name = "test_failure"
+regex = '(?i)(\d+)\s+(failed|failing)'
+sensation = "test_failed"
+debounce_ms = 1000
+
+[[patterns]]
+name = "rust_panic"
+regex = 'thread .* panicked at'
+sensation = "compile_error_severe"
+
+# ----------------------------------------------------------------------------
+# Exit sensations
+#
+# Fired when the wrapped command exits, based on its exit code and how
+# long it ran.
+# ----------------------------------------------------------------------------
+[on_exit]
+# Sensation on exit code 0. Set to "" to disable.
+success_sensation = "deploy_success"
+
+# Sensation on nonzero exit code. Set to "" to disable.
+failure_sensation = "compile_error_severe"
+
+# Don't celebrate trivially fast successes (e.g. `npm run lint` finishing
+# in 200 ms). Default 30000 (30 s).
+success_min_duration_ms = 30000
+
+# Don't double-fire on failure if a [[patterns]] entry already matched
+# within the last N ms. Default 2000.
+failure_dedupe_window_ms = 2000
