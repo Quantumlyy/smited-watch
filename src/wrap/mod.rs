@@ -48,7 +48,7 @@ pub mod spawn;
 pub mod stdin;
 pub mod tee;
 
-use self::signal::{install_handlers, MasterPtyHandle, ShutdownState};
+use self::signal::{install_handlers, MasterPtyHandle, ShutdownState, SignalTarget};
 use self::spawn::{spawn as spawn_child, ChildIo};
 use self::stdin::{spawn_stdin_forwarder, RawModeGuard};
 use self::tee::{spawn_blocking_reader, tee_task, Drops, SinkKind, CHANNEL_CAPACITY};
@@ -126,9 +126,11 @@ pub async fn run(opts: WrapOptions) -> Result<ExitStatus> {
                 scan_drops.clone(),
             )));
 
-            let child_pid = pty.child.process_id();
+            // PTY-mode children are session leaders via portable-pty's
+            // setsid, so always Pgrp targeting.
+            let target = SignalTarget::new(pty.child.process_id(), true);
             let master_arc: Arc<MasterPtyHandle> = Arc::new(MasterPtyHandle::new(pty.master));
-            signal_aborts = install_handlers(child_pid, Some(master_arc), shutdown_state.clone())?;
+            signal_aborts = install_handlers(target, Some(master_arc), shutdown_state.clone())?;
 
             // Wait for the child on a blocking thread (portable-pty's
             // `Child` is sync). The Child handle is owned by this
@@ -157,8 +159,10 @@ pub async fn run(opts: WrapOptions) -> Result<ExitStatus> {
                 async_tee(stderr, SinkKind::Stderr, scan_tx_b, drops_b).await;
             }));
 
-            let child_pid = pipes.child.id();
-            signal_aborts = install_handlers(child_pid, None, shutdown_state.clone())?;
+            // Pipe-mode children are pgrp leaders only when stdin was
+            // non-TTY at spawn time (see spawn_pipes for the rationale).
+            let target = SignalTarget::new(pipes.child.id(), pipes.pgrp_leader);
+            signal_aborts = install_handlers(target, None, shutdown_state.clone())?;
 
             // The child handle stays in this scope; we don't share it
             // with the signal handler, which forwards via the saved PID.

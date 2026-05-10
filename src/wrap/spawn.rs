@@ -39,6 +39,11 @@ pub struct PipeChild {
     pub stdout: ChildStdout,
     pub stderr: ChildStderr,
     pub child: tokio::process::Child,
+    /// True iff `process_group(0)` ran during spawn — that is, the child
+    /// is the leader of a fresh process group whose pgid equals its PID.
+    /// The signal handler uses this to choose between targeting the
+    /// single PID and targeting the whole pgrp via `kill(-pid, …)`.
+    pub pgrp_leader: bool,
 }
 
 /// Decide whether to use a PTY (both parent streams are TTYs) or plain pipes.
@@ -129,13 +134,32 @@ fn spawn_pipes(cmd: &[OsString]) -> Result<PipeChild> {
         // Inherit stdin so the child reads the parent's stdin directly,
         // unbuffered through the OS, without the watcher in the loop.
         .stdin(Stdio::inherit());
-    // Put the child in its own process group (pgid = child's pid) so the
-    // signal handler can target the entire group with `kill(-pid, signum)`
-    // and reach any descendants the child spawns. Without this, the child
-    // inherits the wrapper's pgrp and `kill(-pid, …)` either no-ops
-    // (ESRCH) or, worse, signals the wrapper itself.
+
+    // Put the child in its own process group (pgid = child's pid) ONLY
+    // when stdin is *not* a controlling terminal. If we always called
+    // `process_group(0)` the child would be in a *background* pgrp
+    // relative to the parent's controlling TTY; a `read(stdin)` from
+    // that child triggers SIGTTIN and the child suspends — turning
+    // `smited-watch -- bash -c 'read x' >out` into a hang.
+    //
+    // The pgrp leader status is what powers `kill(-pid, signum)`
+    // descendant signalling. When stdin is a TTY we lose that for the
+    // pipe-mode case (interactive children with redirected output) and
+    // forward to the single child PID instead. In practice this is fine:
+    // when the user hits Ctrl-C in their terminal, the kernel sends
+    // SIGINT to the foreground pgrp anyway — which still includes the
+    // child (since we *didn't* setpgid it).
+    let mut pgrp_leader = false;
     #[cfg(unix)]
-    command.process_group(0);
+    {
+        use std::io::IsTerminal;
+        let stdin_is_tty = std::io::stdin().is_terminal();
+        if !stdin_is_tty {
+            command.process_group(0);
+            pgrp_leader = true;
+        }
+    }
+
     let mut child = command.spawn().context("spawn child via pipes")?;
     let stdout = child
         .stdout
@@ -149,6 +173,7 @@ fn spawn_pipes(cmd: &[OsString]) -> Result<PipeChild> {
         stdout,
         stderr,
         child,
+        pgrp_leader,
     })
 }
 

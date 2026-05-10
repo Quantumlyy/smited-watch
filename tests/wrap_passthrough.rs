@@ -293,6 +293,61 @@ fn sigterm_to_wrapper_kills_descendants_via_process_group() {
     }
 }
 
+#[cfg(unix)]
+#[test]
+fn child_reading_stdin_does_not_get_sigttin_when_stdin_is_a_tty() {
+    // The reviewer's #2 scenario: `smited-watch -- bash -c 'read -t 1 x' >out`
+    // hangs pre-fix because the child gets `process_group(0)` and is
+    // therefore in a *background* pgrp relative to the parent's
+    // controlling TTY; reading stdin then triggers SIGTTIN and stops it.
+    //
+    // Reproducing that bug requires stdin to actually be a TTY, which a
+    // captured cargo-test child doesn't have. We open /dev/tty directly
+    // as the wrapper's stdin so the same kernel rules kick in. If
+    // /dev/tty isn't available (CI without a controlling terminal), the
+    // test skips rather than failing — there's no portable way to fake
+    // a controlling TTY.
+    let tty = match std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open("/dev/tty")
+    {
+        Ok(t) => t,
+        Err(_) => {
+            eprintln!("SKIP: /dev/tty not available in this environment");
+            return;
+        }
+    };
+
+    let (_dir, cfg) = empty_config();
+    let started = std::time::Instant::now();
+    // `read -t 1 x` returns nonzero on timeout but does NOT hang. The
+    // bug presents as the wrapper waiting much longer than 1 second
+    // because bash is suspended on SIGTTIN and never gets to time out.
+    let out = binary(&cfg)
+        .stdin(tty)
+        .arg("--")
+        .arg("bash")
+        .arg("-c")
+        .arg("read -t 1 x; echo exit=$?")
+        .output()
+        .expect("run smited-watch");
+    let elapsed = started.elapsed();
+
+    assert!(
+        elapsed < std::time::Duration::from_secs(5),
+        "wrapper took {elapsed:?} — bash's `read -t 1` should time out in 1s; \
+         a long wait means the child was suspended on SIGTTIN"
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("exit="),
+        "bash should have run to completion and printed its exit line; \
+         got stdout={stdout:?}, status={:?}",
+        out.status
+    );
+}
+
 #[test]
 fn no_command_prints_help_and_exits_nonzero() {
     let (_dir, cfg) = empty_config();

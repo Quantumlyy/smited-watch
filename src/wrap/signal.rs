@@ -59,16 +59,43 @@ impl ShutdownState {
     }
 }
 
+/// What the signal handler should kill on SIGINT/SIGTERM.
+#[derive(Debug, Clone, Copy)]
+pub enum SignalTarget {
+    /// Single process — used in pipe mode when stdin is a TTY (the child
+    /// inherited the wrapper's pgrp, so `kill(-pid, …)` would ESRCH or,
+    /// worse, signal the wrapper itself).
+    Pid(u32),
+    /// Process group leader — `kill(-pid, …)` reaches the leader plus any
+    /// descendants spawned in the same group.
+    Pgrp(u32),
+}
+
+impl SignalTarget {
+    /// Build from a child PID + a flag indicating whether the child is a
+    /// pgrp leader (set by `process_group(0)` in pipe mode, or by
+    /// portable-pty's `setsid` in PTY mode).
+    pub fn new(pid: Option<u32>, pgrp_leader: bool) -> Option<Self> {
+        let pid = pid?;
+        Some(if pgrp_leader {
+            Self::Pgrp(pid)
+        } else {
+            Self::Pid(pid)
+        })
+    }
+}
+
 /// Install async signal handlers. Returns the abort handles for the
 /// spawned tasks so the orchestrator can stop them once the child has
 /// exited (otherwise they'd block waiting for a signal that's never
 /// coming, leaking memory across long-running parent processes).
 ///
-/// `child_pid` is the OS PID of the wrapped command. If `None`, signal
-/// forwarding is a no-op (we can still record `shutdown_due_to_signal`).
+/// `target` describes the wrapped command — see [`SignalTarget`]. `None`
+/// means signal forwarding is a no-op (we can still record
+/// `shutdown_due_to_signal`).
 #[cfg(unix)]
 pub fn install_handlers(
-    child_pid: Option<u32>,
+    target: Option<SignalTarget>,
     master: Option<Arc<dyn MasterPtyExt>>,
     state: Arc<ShutdownState>,
 ) -> Result<Vec<tokio::task::AbortHandle>> {
@@ -87,26 +114,8 @@ pub fn install_handlers(
             // on second/third Ctrl-C themselves (Node, Cargo, etc.).
             while sig.recv().await.is_some() {
                 state.signal();
-                if let Some(pid) = child_pid {
-                    debug!(
-                        pid,
-                        signum, "smited-watch: signal received, forwarding to child pgrp"
-                    );
-                    // We forward to the negative PID (the child's process
-                    // group). PTY-mode children are session leaders via
-                    // portable-pty's setsid; pipe-mode children are made
-                    // pgrp leaders via `process_group(0)` at spawn time.
-                    // In both cases pgid == pid, so `kill(-pid, signum)`
-                    // signals the child *and* any descendants it spawned
-                    // in the same group — matching what the controlling
-                    // terminal would do for a real Ctrl-C.
-                    //
-                    // SAFETY: kill(2) is async-signal-safe and returns -1
-                    // on error rather than UB. We ignore the return — if
-                    // the group has already exited, ESRCH is fine.
-                    unsafe {
-                        libc::kill(-(pid as libc::pid_t), signum);
-                    }
+                if let Some(t) = target {
+                    forward_signal(t, signum);
                 }
             }
         });
@@ -135,6 +144,33 @@ pub fn install_handlers(
     Ok(handles)
 }
 
+/// Forward `signum` to the wrapped command, dispatching on whether the
+/// child is a pgrp leader (group target) or just a single PID.
+///
+/// SAFETY of `kill(2)`: async-signal-safe, returns `-1` on error rather
+/// than UB. We ignore the return value — if the group has already
+/// exited, ESRCH is fine.
+#[cfg(unix)]
+fn forward_signal(target: SignalTarget, signum: i32) {
+    match target {
+        SignalTarget::Pid(pid) => {
+            debug!(pid, signum, "smited-watch: forwarding signal to child PID");
+            unsafe {
+                libc::kill(pid as libc::pid_t, signum);
+            }
+        }
+        SignalTarget::Pgrp(pid) => {
+            debug!(
+                pgid = pid,
+                signum, "smited-watch: forwarding signal to child process group"
+            );
+            unsafe {
+                libc::kill(-(pid as libc::pid_t), signum);
+            }
+        }
+    }
+}
+
 /// Windows: best-effort. There's no equivalent of "forward this exact
 /// signal" — we listen for Ctrl-C and call `TerminateProcess` via
 /// `OpenProcess` + `TerminateProcess`. v0.1 punts on this and just sets
@@ -142,7 +178,7 @@ pub fn install_handlers(
 /// inheritance.
 #[cfg(windows)]
 pub fn install_handlers(
-    _child_pid: Option<u32>,
+    _target: Option<SignalTarget>,
     _master: Option<Arc<dyn MasterPtyExt>>,
     state: Arc<ShutdownState>,
 ) -> Result<Vec<tokio::task::AbortHandle>> {
