@@ -43,3 +43,4 @@ tonic-prost-build = "0.14"
 [dev-dependencies]
 tempfile = "3"
 assert_cmd = "2"
+tokio = { version = "1.52", features = ["full", "test-util"] }
