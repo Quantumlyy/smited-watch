@@ -42,6 +42,14 @@ libc = "0.2"
 
 [build-dependencies]
 tonic-prost-build = "0.14"
+# Ships pre-built `protoc` binaries for major host triples so `cargo install`
+# from a fresh machine works without the user having to install protobuf
+# system packages first. Justified beyond the spec's dep list: tonic 0.14
+# moved codegen to `prost-build`, which delegates to a `protoc` invocation;
+# without this crate every consumer has to apt/brew/scoop install protobuf
+# before `cargo install --git …` succeeds, which contradicts the README's
+# "only a Rust toolchain" promise.
+protoc-bin-vendored = "3.2"
 
 [dev-dependencies]
 tempfile = "3"
