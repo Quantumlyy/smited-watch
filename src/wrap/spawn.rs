@@ -46,19 +46,29 @@ pub struct PipeChild {
     pub pgrp_leader: bool,
 }
 
-/// Decide whether to use a PTY (both parent streams are TTYs) or plain pipes.
+/// Decide whether to use a PTY (every parent stream is a TTY) or plain pipes.
 ///
-/// We require **both** stdout and stderr to be TTYs, not just stdout: PTYs
-/// merge the child's stdout and stderr into a single master stream that we
-/// then write to the parent's stdout. If the user wrote
-/// `smited-watch -- cmd 2>err`, they expect the child's stderr to land in
-/// `err` — but in PTY mode it would silently end up on stdout (the
-/// terminal). The conservative rule "PTY only when both streams are TTYs"
-/// preserves the user's redirection intent: the moment either stream is
-/// redirected, we drop to pipe mode where stdout and stderr stay separate.
+/// All three of stdin, stdout, and stderr must be TTYs:
+///
+/// * **stdout** and **stderr**: PTYs merge child stdout and stderr into a
+///   single master stream that we then write to the parent's stdout. If
+///   the user wrote `smited-watch -- cmd 2>err`, they expect the child's
+///   stderr to land in `err` — but in PTY mode it would silently end up
+///   on stdout (the terminal).
+/// * **stdin**: in PTY mode the child reads from the PTY slave, which is
+///   itself a TTY. If the parent's stdin is a *pipe*
+///   (`printf '…' | smited-watch -- python`), routing through a PTY
+///   makes the child see stdin as a TTY and switch into interactive
+///   mode (REPL prompts, line editing, etc.) — exactly the opposite of
+///   what the user asked for.
+///
+/// The moment any of the three is non-TTY, we drop to pipe mode where
+/// stdout and stderr stay separate and stdin is inherited as-is.
 pub fn parent_is_tty() -> bool {
     use std::io::IsTerminal;
-    std::io::stdout().is_terminal() && std::io::stderr().is_terminal()
+    std::io::stdin().is_terminal()
+        && std::io::stdout().is_terminal()
+        && std::io::stderr().is_terminal()
 }
 
 /// Spawn the child command. `cmd[0]` is the program; the rest are args.
