@@ -15,10 +15,15 @@ fn main() -> ! {
         std::process::exit(2);
     }
 
-    // SMITED_WATCH_DISABLE=1 → pure passthrough.
-    let disabled = std::env::var("SMITED_WATCH_DISABLE")
-        .map(|v| v == "1")
-        .unwrap_or(false);
+    // SMITED_WATCH_DISABLE=1 → pure passthrough. The spec says: "spawns
+    // the command, pipes stdio, exits with the inner code, fires no
+    // triggers." We bypass `wrap::run` *entirely* — no PTY allocation,
+    // no scanner, no tee, no tokio runtime. The child inherits our
+    // stdin/stdout/stderr unmodified, so its TTY-detection logic sees
+    // exactly what it would have seen without the wrapper.
+    if std::env::var("SMITED_WATCH_DISABLE").as_deref() == Ok("1") {
+        std::process::exit(run_disabled_passthrough(cli.command));
+    }
 
     let runtime = match tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -31,12 +36,7 @@ fn main() -> ! {
         }
     };
 
-    let exit_code = runtime.block_on(async move {
-        if disabled {
-            return run_passthrough(cli).await;
-        }
-        run_with_config(cli).await
-    });
+    let exit_code = runtime.block_on(async move { run_with_config(cli).await });
 
     // We deliberately use `std::process::exit(i32)` rather than returning
     // `std::process::ExitCode::from(u8)` so the wrapped command's full
@@ -115,24 +115,41 @@ async fn run_with_config(cli: Cli) -> anyhow::Result<i32> {
     Ok(propagate_exit_code(status))
 }
 
-/// SMITED_WATCH_DISABLE=1 path: spawn the command, pipe stdio, exit with
-/// its code. No config load, no scanning, no triggers.
-async fn run_passthrough(cli: Cli) -> anyhow::Result<i32> {
-    let opts = smited_watch::wrap::WrapOptions {
-        cmd: cli.command,
-        patterns: std::sync::Arc::new(Vec::new()),
-        debouncers: std::sync::Arc::new(Vec::new()),
-        trigger_client: std::sync::Arc::new(smited_watch::client::TriggerClient::new(
-            None,
-            smited_watch::config::ConnectionStrategy::Persistent,
-            std::time::Duration::from_millis(500),
-        )),
-        default_backend_id: DEFAULT_BACKEND_ID.to_string(),
-        on_exit: smited_watch::config::OnExit::default(),
-        force_pipes: false,
+/// `SMITED_WATCH_DISABLE=1` passthrough: synchronously spawn the wrapped
+/// command with all three stdio handles inherited from the parent, wait
+/// for it to exit, propagate the exit code. No tokio, no PTY, no
+/// scanning, no triggers.
+///
+/// The child inherits our pgrp by default (we do *not* call
+/// `process_group(0)`), so a Ctrl-C in the parent terminal reaches both
+/// us and the child via the kernel's foreground-pgrp delivery — no
+/// signal-handler plumbing needed.
+fn run_disabled_passthrough(cmd: Vec<std::ffi::OsString>) -> i32 {
+    use std::process::{Command, Stdio};
+    if cmd.is_empty() {
+        eprintln!("[smited-watch] disable mode: no command given");
+        return 1;
+    }
+    let mut child = match Command::new(&cmd[0])
+        .args(&cmd[1..])
+        .stdin(Stdio::inherit())
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit())
+        .spawn()
+    {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("[smited-watch] failed to spawn {:?}: {e}", cmd[0]);
+            return 1;
+        }
     };
-    let status = smited_watch::wrap::run(opts).await?;
-    Ok(propagate_exit_code(status))
+    match child.wait() {
+        Ok(status) => propagate_exit_code(status),
+        Err(e) => {
+            eprintln!("[smited-watch] failed to wait on child: {e}");
+            1
+        }
+    }
 }
 
 fn build_wrap_options(
