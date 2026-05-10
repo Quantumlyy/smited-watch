@@ -13,7 +13,8 @@ This builds from the latest `main` and installs the binary into
 `~/.cargo/bin/smited-watch`. Make sure that's on your `$PATH`.
 
 You'll need a recent stable Rust toolchain (`rustup default stable`).
-The repo currently targets `rustc 1.75` and newer.
+The repo currently targets `rustc 1.88` and newer (declared as
+`rust-version = "1.88"` in `Cargo.toml`).
 
 ## Pinning a specific version
 
