@@ -208,7 +208,15 @@ pub async fn run(opts: WrapOptions) -> Result<ExitStatus> {
     // We don't join it — the process will exit shortly.
     drop(stdin_thread);
 
-    // Drain the scanner of any final partial line and dispatch matches.
+    // Wait for the scan consumer to drain every queued chunk *first*. Only
+    // after `scan_consumer.await` returns is the scanner's internal buffer
+    // guaranteed to contain all bytes produced by the child — calling
+    // `scanner.flush()` earlier would emit a stale partial line and we'd
+    // never see the trailing one for commands that print a final line
+    // without a `\n`.
+    let _ = scan_consumer.await;
+
+    // Now flush any trailing partial line and dispatch its matches.
     let final_events = scanner.flush();
     if !final_events.is_empty() {
         dispatch_events(
@@ -220,9 +228,6 @@ pub async fn run(opts: WrapOptions) -> Result<ExitStatus> {
             &last_pattern_fire,
         );
     }
-
-    // Wait for the scan consumer to drain whatever was already in flight.
-    let _ = scan_consumer.await;
 
     let drops = scan_drops.load(std::sync::atomic::Ordering::Relaxed);
     if drops > 0 {
@@ -243,11 +248,12 @@ pub async fn run(opts: WrapOptions) -> Result<ExitStatus> {
         now: Instant::now(),
     });
 
-    // Spec: wait up to 1s for in-flight trigger calls to complete. We
-    // don't track them individually — a fixed sleep is the simplest
-    // correct implementation and matches the spec text. Most fires
-    // complete in tens of ms; the 1s ceiling caps worst-case wait.
-    tokio::time::sleep(Duration::from_secs(1)).await;
+    // Spec: "Wait up to 1s for any in-flight trigger calls to complete.
+    // Log warnings for stragglers but exit anyway." `drain` actually
+    // awaits the spawned tasks rather than sleeping a fixed duration, so
+    // we exit promptly when fires complete and only pay the full 1s if
+    // something is genuinely stuck.
+    opts.trigger_client.drain(Duration::from_secs(1)).await;
 
     // Restore terminal cooked mode before returning.
     drop(raw_mode_guard);
