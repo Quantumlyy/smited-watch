@@ -41,10 +41,19 @@ pub struct PipeChild {
     pub child: tokio::process::Child,
 }
 
-/// Decide whether to use a PTY (parent stdout is a TTY) or plain pipes.
+/// Decide whether to use a PTY (both parent streams are TTYs) or plain pipes.
+///
+/// We require **both** stdout and stderr to be TTYs, not just stdout: PTYs
+/// merge the child's stdout and stderr into a single master stream that we
+/// then write to the parent's stdout. If the user wrote
+/// `smited-watch -- cmd 2>err`, they expect the child's stderr to land in
+/// `err` — but in PTY mode it would silently end up on stdout (the
+/// terminal). The conservative rule "PTY only when both streams are TTYs"
+/// preserves the user's redirection intent: the moment either stream is
+/// redirected, we drop to pipe mode where stdout and stderr stay separate.
 pub fn parent_is_tty() -> bool {
     use std::io::IsTerminal;
-    std::io::stdout().is_terminal()
+    std::io::stdout().is_terminal() && std::io::stderr().is_terminal()
 }
 
 /// Spawn the child command. `cmd[0]` is the program; the rest are args.
