@@ -3,8 +3,10 @@
 pub mod client;
 pub mod config;
 pub mod debounce;
+pub mod exit;
 pub mod scan;
 pub mod trigger;
+pub mod wrap;
 
 pub mod proto {
     pub mod smited {
