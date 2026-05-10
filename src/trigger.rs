@@ -26,6 +26,11 @@ use crate::proto::smited::v1::{trigger_request::Sensation, TriggerRequest};
 /// override. If the pattern's optional `intensity_scale` is unset, the
 /// daemon falls back to the sensation's own default; same for `priority`,
 /// which defaults to 0 in the proto when omitted by the client.
+///
+/// The pattern's `name` is sanitized into the trace ID via
+/// [`sanitize_for_trace_id`] — the proto's protovalidate constraints
+/// only allow `[a-zA-Z0-9_-]` and a 128-char max, but our config
+/// loader doesn't reject names like `"TS error"`.
 pub fn build_pattern_trigger(pattern: &Pattern, default_backend_id: &str) -> TriggerRequest {
     let backend_id = pattern
         .backend_id
@@ -37,7 +42,11 @@ pub fn build_pattern_trigger(pattern: &Pattern, default_backend_id: &str) -> Tri
         zone_ids: Vec::new(),
         intensity_scale: pattern.intensity_scale,
         priority: pattern.priority.unwrap_or(0),
-        client_trace_id: format!("watch-{}-{}", pattern.name, unix_ms_now()),
+        client_trace_id: format!(
+            "watch-{}-{}",
+            sanitize_for_trace_id(&pattern.name),
+            unix_ms_now()
+        ),
         sensation: Some(Sensation::SensationName(pattern.sensation.clone())),
     }
 }
@@ -62,6 +71,39 @@ fn unix_ms_now() -> u128 {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_millis())
         .unwrap_or(0)
+}
+
+/// Reserved budget for the wrapper's own framing (`watch-`, `-<unix_ms>`,
+/// etc.) inside a 128-char trace ID. `unix_ms_now()` returns up to 13
+/// digits (year 2286), and `"watch-…-"` is 7 framing chars; cap the
+/// caller-controlled middle slot at 100 to leave generous headroom.
+const TRACE_ID_NAME_BUDGET: usize = 100;
+
+/// Sanitize an identifier (typically a `[[patterns]].name` value) so it
+/// fits inside a `client_trace_id` that satisfies the proto's
+/// protovalidate constraints — `^[a-zA-Z0-9_-]*$` and max length 128.
+///
+/// Non-IDENT characters are replaced with `_` rather than dropped so the
+/// result keeps a 1:1 character-position correspondence with the source
+/// (easier to spot what was sanitized when scanning logs). Empty input
+/// becomes `unnamed` so the trace ID never collapses to `watch--<ts>`,
+/// which would parse as an empty middle section.
+pub fn sanitize_for_trace_id(name: &str) -> String {
+    if name.is_empty() {
+        return "unnamed".into();
+    }
+    let mut out = String::with_capacity(name.len());
+    for c in name.chars() {
+        if c.is_ascii_alphanumeric() || c == '_' || c == '-' {
+            out.push(c);
+        } else {
+            out.push('_');
+        }
+    }
+    if out.len() > TRACE_ID_NAME_BUDGET {
+        out.truncate(TRACE_ID_NAME_BUDGET);
+    }
+    out
 }
 
 #[cfg(test)]
@@ -144,6 +186,65 @@ mod tests {
         assert!(
             !suffix.is_empty() && suffix.chars().all(|c| c.is_ascii_digit()),
             "got suffix {suffix:?}"
+        );
+    }
+
+    #[test]
+    fn sanitize_for_trace_id_replaces_non_ident_chars_with_underscore() {
+        assert_eq!(sanitize_for_trace_id("TS error"), "TS_error");
+        assert_eq!(sanitize_for_trace_id("vite-warn"), "vite-warn");
+        assert_eq!(sanitize_for_trace_id("ts_err"), "ts_err");
+        assert_eq!(
+            sanitize_for_trace_id("path/to/error.rs:42"),
+            "path_to_error_rs_42"
+        );
+        assert_eq!(sanitize_for_trace_id("emoji 🔥"), "emoji__"); // 🔥 = 1 char → 1 _
+    }
+
+    #[test]
+    fn sanitize_for_trace_id_empty_becomes_named_placeholder() {
+        // Otherwise the trace ID would render as "watch--<ts>" with an
+        // empty middle slot, which is technically valid but useless.
+        assert_eq!(sanitize_for_trace_id(""), "unnamed");
+    }
+
+    #[test]
+    fn sanitize_for_trace_id_caps_length_so_trace_stays_under_128() {
+        let huge = "x".repeat(500);
+        let s = sanitize_for_trace_id(&huge);
+        assert!(s.len() <= 100, "got len {}", s.len());
+        // Sanity: full trace ID stays under 128 even with year-2286-sized timestamp.
+        let trace = format!("watch-{}-{}", s, "1234567890123");
+        assert!(trace.len() < 128, "trace ID len {}", trace.len());
+    }
+
+    #[test]
+    fn pattern_trigger_with_invalid_chars_in_name_still_produces_valid_trace_id() {
+        // The proto's protovalidate rule on TriggerRequest.client_trace_id
+        // is `^[a-zA-Z0-9_-]*$` and max_len=128. A pattern with a
+        // human-friendly name like "TS error" must not produce a trace
+        // ID the daemon rejects.
+        let p = pat_min("TS error / build", "compile_error_mild");
+        let req = build_pattern_trigger(&p, "mock-owo");
+        // No chars outside [a-zA-Z0-9_-] in the trace ID.
+        for c in req.client_trace_id.chars() {
+            assert!(
+                c.is_ascii_alphanumeric() || c == '_' || c == '-',
+                "trace id char {c:?} violates proto's [a-zA-Z0-9_-] rule \
+                 (full id: {})",
+                req.client_trace_id
+            );
+        }
+        assert!(
+            req.client_trace_id.len() <= 128,
+            "trace id over proto's 128-char limit: {} chars",
+            req.client_trace_id.len()
+        );
+        // Specifically: spaces and slashes should have become underscores.
+        assert!(
+            req.client_trace_id.contains("TS_error___build"),
+            "expected sanitized form in trace id, got {}",
+            req.client_trace_id
         );
     }
 
