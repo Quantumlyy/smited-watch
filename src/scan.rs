@@ -48,17 +48,37 @@ pub const MAX_LINE: usize = 64 * 1024;
 /// middle of a long compiler error.
 const EXCERPT_MAX: usize = 512;
 
+/// Which of the wrapped command's output streams a chunk came from.
+///
+/// The scanner keeps a *separate* line buffer per stream so a partial
+/// stdout line that hasn't yet seen its `\n` can't get spliced together
+/// with bytes that arrive on stderr — splicing would let the regex
+/// match a line the child never actually emitted. In PTY mode there is
+/// only one stream; the orchestrator labels it [`StreamId::Stdout`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum StreamId {
+    Stdout = 0,
+    Stderr = 1,
+}
+
+/// Number of distinct streams the scanner buffers. Bumping this requires
+/// matching changes to [`StreamId`] and the per-stream array indexing.
+const STREAM_COUNT: usize = 2;
+
 /// One pattern matching one line.
 #[derive(Debug, Clone)]
 pub struct MatchEvent {
     /// Index into the `patterns` vector the [`Scanner`] was built with.
     pub pattern_idx: usize,
+    /// Which child stream the matching line came from.
+    pub stream: StreamId,
     /// First [`EXCERPT_MAX`] bytes of the matching line (UTF-8-replaced),
     /// for log output. The line is ANSI-stripped before being captured.
     pub line_excerpt: String,
 }
 
-/// Stateful scanner: holds the [`RegexSet`] and the rolling line buffer.
+/// Stateful scanner: holds the [`RegexSet`] and *per-stream* rolling
+/// line buffers.
 #[derive(Debug)]
 pub struct Scanner {
     set: RegexSet,
@@ -66,7 +86,8 @@ pub struct Scanner {
     /// dispatch tasks that need to look up `Pattern` metadata by index.
     #[allow(dead_code)]
     patterns: Arc<Vec<Pattern>>,
-    buf: Mutex<BytesMut>,
+    /// Indexed by `StreamId as usize`.
+    bufs: Mutex<[BytesMut; STREAM_COUNT]>,
 }
 
 impl Scanner {
@@ -88,20 +109,23 @@ impl Scanner {
         Ok(Self {
             set,
             patterns,
-            buf: Mutex::new(BytesMut::new()),
+            bufs: Mutex::new([BytesMut::new(), BytesMut::new()]),
         })
     }
 
-    /// Feed bytes from the wrapped command's stdout/stderr stream.
+    /// Feed bytes from one of the wrapped command's output streams.
     ///
     /// Returns one [`MatchEvent`] per matching `(line, pattern)` pair.
     /// Lines that don't match any pattern produce no events.
     ///
-    /// Lines longer than [`MAX_LINE`] are force-flushed, possibly
-    /// truncated; a debug-level log records the truncation.
-    pub fn feed(&self, bytes: &[u8]) -> Vec<MatchEvent> {
+    /// Bytes go into the buffer for `stream`, never crossing over to
+    /// the other stream's buffer. Lines longer than [`MAX_LINE`] are
+    /// force-flushed, possibly truncated; a debug-level log records
+    /// the truncation.
+    pub fn feed(&self, stream: StreamId, bytes: &[u8]) -> Vec<MatchEvent> {
         let mut events = Vec::new();
-        let mut buf = self.buf.lock().expect("scanner buffer poisoned");
+        let mut bufs = self.bufs.lock().expect("scanner buffer poisoned");
+        let buf = &mut bufs[stream as usize];
         buf.extend_from_slice(bytes);
         loop {
             // Drain any complete `\n`-delimited lines first.
@@ -112,7 +136,7 @@ impl Scanner {
                 if content.last() == Some(&b'\r') {
                     content = &content[..content.len() - 1];
                 }
-                self.scan_line(content, &mut events);
+                self.scan_line(stream, content, &mut events);
                 continue;
             }
             // No newline in the buffer. Force-flush if oversized.
@@ -121,9 +145,10 @@ impl Scanner {
                 let drained = buf.split_to(len);
                 debug!(
                     line_len = drained.len(),
+                    ?stream,
                     "scanner: force-flushing line at MAX_LINE without newline"
                 );
-                self.scan_line(&drained, &mut events);
+                self.scan_line(stream, &drained, &mut events);
                 continue;
             }
             break;
@@ -131,24 +156,29 @@ impl Scanner {
         events
     }
 
-    /// Drain any trailing partial line (no newline yet).
-    ///
-    /// Call this once on stream EOF so the last logical line gets one
-    /// final scan pass — otherwise a wrapped command that prints a final
-    /// status line without a trailing newline would have its match dropped.
-    pub fn flush(&self) -> Vec<MatchEvent> {
-        let mut buf = self.buf.lock().expect("scanner buffer poisoned");
+    /// Drain any trailing partial line for one stream (no newline yet).
+    pub fn flush(&self, stream: StreamId) -> Vec<MatchEvent> {
+        let mut bufs = self.bufs.lock().expect("scanner buffer poisoned");
+        let buf = &mut bufs[stream as usize];
         let len = buf.len();
         if len == 0 {
             return Vec::new();
         }
         let drained = buf.split_to(len);
         let mut events = Vec::new();
-        self.scan_line(&drained, &mut events);
+        self.scan_line(stream, &drained, &mut events);
         events
     }
 
-    fn scan_line(&self, content: &[u8], out: &mut Vec<MatchEvent>) {
+    /// Drain trailing partial lines for *every* stream. Used at shutdown
+    /// after both reader pipelines have been drained.
+    pub fn flush_all(&self) -> Vec<MatchEvent> {
+        let mut events = self.flush(StreamId::Stdout);
+        events.extend(self.flush(StreamId::Stderr));
+        events
+    }
+
+    fn scan_line(&self, stream: StreamId, content: &[u8], out: &mut Vec<MatchEvent>) {
         let stripped = strip_ansi_escapes::strip(content);
         // RegexSet operates on &str; lossily convert so non-UTF-8 bytes
         // don't sink the scan.
@@ -161,6 +191,7 @@ impl Scanner {
         for idx in matches.iter() {
             out.push(MatchEvent {
                 pattern_idx: idx,
+                stream,
                 line_excerpt: excerpt.clone(),
             });
         }

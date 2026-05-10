@@ -37,6 +37,8 @@ use tokio::io::AsyncWriteExt;
 use tokio::sync::mpsc;
 use tracing::debug;
 
+use crate::scan::StreamId;
+
 /// Maximum buffered chunks between the blocking reader thread and the
 /// async tee task, and between the tee task and the scanner consumer.
 pub const CHANNEL_CAPACITY: usize = 1024;
@@ -50,6 +52,15 @@ const READ_BUF: usize = 8 * 1024;
 pub enum SinkKind {
     Stdout,
     Stderr,
+}
+
+impl From<SinkKind> for StreamId {
+    fn from(s: SinkKind) -> Self {
+        match s {
+            SinkKind::Stdout => StreamId::Stdout,
+            SinkKind::Stderr => StreamId::Stderr,
+        }
+    }
 }
 
 /// Counter shared between the tee task and the orchestrator's shutdown
@@ -93,7 +104,8 @@ pub fn spawn_blocking_reader(
 }
 
 /// Async task: pull chunks from `rx`, write them to the parent stream
-/// (Stdout or Stderr), then fan out a copy to `scan_tx`.
+/// (Stdout or Stderr), then fan out a copy to `scan_tx` tagged with the
+/// originating [`StreamId`] so the scanner buffers them separately.
 ///
 /// On `scan_tx` being full, the chunk is dropped and `drops` is
 /// incremented; the chunk has already been written to the parent stream
@@ -101,7 +113,7 @@ pub fn spawn_blocking_reader(
 pub async fn tee_task(
     rx: mpsc::Receiver<Bytes>,
     sink: SinkKind,
-    scan_tx: mpsc::Sender<Bytes>,
+    scan_tx: mpsc::Sender<(StreamId, Bytes)>,
     drops: Drops,
 ) {
     // tokio::io::Stdout and Stderr have different concrete types — we
@@ -117,11 +129,12 @@ async fn tee_loop<W>(
     mut rx: mpsc::Receiver<Bytes>,
     mut writer: W,
     sink: SinkKind,
-    scan_tx: mpsc::Sender<Bytes>,
+    scan_tx: mpsc::Sender<(StreamId, Bytes)>,
     drops: Drops,
 ) where
     W: AsyncWriteExt + Unpin,
 {
+    let stream_id: StreamId = sink.into();
     while let Some(chunk) = rx.recv().await {
         // Write to parent first — back-pressure on slow terminal naturally
         // throttles the child via OS buffer fill.
@@ -134,7 +147,7 @@ async fn tee_loop<W>(
             debug!(error = %e, ?sink, "tee: parent flush failed");
         }
         // Then fan out to scanner. Drop on full — passthrough latency wins.
-        if scan_tx.try_send(chunk).is_err() {
+        if scan_tx.try_send((stream_id, chunk)).is_err() {
             drops.fetch_add(1, Ordering::Relaxed);
         }
     }

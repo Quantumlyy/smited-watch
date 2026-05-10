@@ -3,7 +3,7 @@
 use std::sync::Arc;
 
 use smited_watch::config::Pattern;
-use smited_watch::scan::{Scanner, MAX_LINE};
+use smited_watch::scan::{Scanner, StreamId, MAX_LINE};
 
 fn pat(name: &str, regex: &str) -> Pattern {
     Pattern {
@@ -25,9 +25,10 @@ fn make_scanner(patterns: Vec<Pattern>) -> Scanner {
 #[test]
 fn single_line_single_pattern_matches() {
     let s = make_scanner(vec![pat("ts", r"error TS\d+")]);
-    let events = s.feed(b"error TS1234\n");
+    let events = s.feed(StreamId::Stdout, b"error TS1234\n");
     assert_eq!(events.len(), 1);
     assert_eq!(events[0].pattern_idx, 0);
+    assert_eq!(events[0].stream, StreamId::Stdout);
     assert!(events[0].line_excerpt.contains("error TS1234"));
 }
 
@@ -38,7 +39,7 @@ fn single_line_multiple_patterns_all_fire() {
         pat("any_error", r"error"),
         pat("digits", r"\d+"),
     ]);
-    let events = s.feed(b"error TS1234\n");
+    let events = s.feed(StreamId::Stdout, b"error TS1234\n");
     let mut idxs: Vec<usize> = events.iter().map(|e| e.pattern_idx).collect();
     idxs.sort();
     assert_eq!(idxs, vec![0, 1, 2]);
@@ -47,14 +48,14 @@ fn single_line_multiple_patterns_all_fire() {
 #[test]
 fn no_match_returns_empty() {
     let s = make_scanner(vec![pat("ts", r"error TS\d+")]);
-    assert!(s.feed(b"nothing here\n").is_empty());
+    assert!(s.feed(StreamId::Stdout, b"nothing here\n").is_empty());
 }
 
 #[test]
 fn ansi_escapes_are_stripped_before_matching() {
     let s = make_scanner(vec![pat("ts", r"error TS\d+")]);
     // Red-coloured "error TS1234" wrapped in ANSI codes.
-    let events = s.feed(b"\x1b[31merror TS1234\x1b[0m\n");
+    let events = s.feed(StreamId::Stdout, b"\x1b[31merror TS1234\x1b[0m\n");
     assert_eq!(events.len(), 1, "ANSI codes must not block the regex");
     assert_eq!(events[0].pattern_idx, 0);
 }
@@ -62,9 +63,9 @@ fn ansi_escapes_are_stripped_before_matching() {
 #[test]
 fn lines_split_across_feed_boundaries_reassemble() {
     let s = make_scanner(vec![pat("ts", r"error TS\d+")]);
-    assert!(s.feed(b"err").is_empty());
-    assert!(s.feed(b"or T").is_empty());
-    let events = s.feed(b"S1234\n");
+    assert!(s.feed(StreamId::Stdout, b"err").is_empty());
+    assert!(s.feed(StreamId::Stdout, b"or T").is_empty());
+    let events = s.feed(StreamId::Stdout, b"S1234\n");
     assert_eq!(events.len(), 1);
     assert_eq!(events[0].pattern_idx, 0);
 }
@@ -72,7 +73,7 @@ fn lines_split_across_feed_boundaries_reassemble() {
 #[test]
 fn multiple_lines_in_one_feed() {
     let s = make_scanner(vec![pat("ts", r"error TS\d+")]);
-    let events = s.feed(b"error TS1\nokay\nerror TS2\n");
+    let events = s.feed(StreamId::Stdout, b"error TS1\nokay\nerror TS2\n");
     assert_eq!(events.len(), 2);
     assert_eq!(events[0].pattern_idx, 0);
     assert_eq!(events[1].pattern_idx, 0);
@@ -82,10 +83,10 @@ fn multiple_lines_in_one_feed() {
 fn final_partial_line_emerges_on_flush() {
     let s = make_scanner(vec![pat("ts", r"error TS\d+")]);
     assert!(
-        s.feed(b"error TS9").is_empty(),
+        s.feed(StreamId::Stdout, b"error TS9").is_empty(),
         "no newline yet — buffered, no event"
     );
-    let events = s.flush();
+    let events = s.flush(StreamId::Stdout);
     assert_eq!(events.len(), 1, "flush must emit the trailing partial line");
     assert_eq!(events[0].pattern_idx, 0);
 }
@@ -93,7 +94,7 @@ fn final_partial_line_emerges_on_flush() {
 #[test]
 fn empty_lines_are_scanned_but_dont_produce_matches() {
     let s = make_scanner(vec![pat("ts", r"error TS\d+")]);
-    assert!(s.feed(b"\n\n\n").is_empty());
+    assert!(s.feed(StreamId::Stdout, b"\n\n\n").is_empty());
 }
 
 #[test]
@@ -105,7 +106,7 @@ fn force_flush_at_max_line_boundary() {
     // log with no newlines.
     let mut chunk = vec![b'.'; MAX_LINE - 12];
     chunk.extend_from_slice(b"error TS9999");
-    let events = s.feed(&chunk);
+    let events = s.feed(StreamId::Stdout, &chunk);
     assert_eq!(
         events.len(),
         1,
@@ -118,7 +119,7 @@ fn force_flush_at_max_line_boundary() {
     // discarded the previous content.
     let more = vec![b'.'; 1024];
     assert!(
-        s.feed(&more).is_empty(),
+        s.feed(StreamId::Stdout, &more).is_empty(),
         "post-flush continuation should not re-match the already-emitted line"
     );
 }
@@ -129,8 +130,8 @@ fn carriage_return_alone_is_not_a_line_terminator() {
     // scanner must NOT treat `\r` as a line terminator (otherwise a single
     // spinner update would produce dozens of fake match attempts).
     let s = make_scanner(vec![pat("ts", r"error TS\d+")]);
-    assert!(s.feed(b"\rerror TS1234").is_empty());
-    let events = s.feed(b"\n");
+    assert!(s.feed(StreamId::Stdout, b"\rerror TS1234").is_empty());
+    let events = s.feed(StreamId::Stdout, b"\n");
     assert_eq!(events.len(), 1);
 }
 
@@ -144,4 +145,61 @@ fn invalid_pattern_regex_at_construction_errors_with_name() {
         msg.contains("broken"),
         "error should mention pattern name, got: {msg}"
     );
+}
+
+/// Stdout's partial line (no newline yet) and stderr's bytes must NOT be
+/// stitched together into a single logical line. Pre-fix the scanner had
+/// one shared buffer, so a stdout chunk "error TS" followed by a stderr
+/// chunk "1234\n" would falsely match `error TS\d+`. Post-fix the
+/// per-stream buffers keep them separate: stdout's prefix stays buffered
+/// until stdout itself emits a newline, and stderr's "1234" alone
+/// doesn't match.
+#[test]
+fn stdout_and_stderr_chunks_do_not_splice_into_one_logical_line() {
+    let s = make_scanner(vec![pat("ts", r"error TS\d+")]);
+    assert!(
+        s.feed(StreamId::Stdout, b"error TS").is_empty(),
+        "stdout prefix without newline buffers but doesn't match"
+    );
+    let stderr_events = s.feed(StreamId::Stderr, b"1234\n");
+    assert!(
+        stderr_events.is_empty(),
+        "stderr emitting '1234\\n' on its own (with no 'error TS' prefix) \
+         must NOT match — got {stderr_events:?}"
+    );
+    // And the stdout prefix is still cleanly buffered for later, undisturbed.
+    let stdout_events = s.feed(StreamId::Stdout, b"5678\n");
+    assert_eq!(
+        stdout_events.len(),
+        1,
+        "stdout's own newline triggers its match"
+    );
+    assert_eq!(stdout_events[0].pattern_idx, 0);
+    assert_eq!(stdout_events[0].stream, StreamId::Stdout);
+    assert!(
+        stdout_events[0].line_excerpt.contains("error TS5678"),
+        "match should be against stdout's own line, not the spliced one; got {}",
+        stdout_events[0].line_excerpt
+    );
+}
+
+/// Both streams have buffered partial lines on EOF; flush_all must drain
+/// each independently.
+#[test]
+fn flush_all_emits_trailing_lines_for_every_stream() {
+    let s = make_scanner(vec![pat("ts", r"error TS\d+")]);
+    assert!(s.feed(StreamId::Stdout, b"error TS1").is_empty());
+    assert!(s.feed(StreamId::Stderr, b"error TS2").is_empty());
+    let events = s.flush_all();
+    assert_eq!(events.len(), 2);
+    let mut by_stream: std::collections::HashMap<StreamId, &str> = std::collections::HashMap::new();
+    for ev in &events {
+        by_stream.insert(ev.stream, &ev.line_excerpt);
+    }
+    assert!(by_stream
+        .get(&StreamId::Stdout)
+        .is_some_and(|s| s.contains("error TS1")));
+    assert!(by_stream
+        .get(&StreamId::Stderr)
+        .is_some_and(|s| s.contains("error TS2")));
 }

@@ -40,7 +40,7 @@ use tracing::{debug, warn};
 use crate::client::TriggerClient;
 use crate::config::{OnExit, Pattern};
 use crate::debounce::{Debouncer, Decision};
-use crate::scan::Scanner;
+use crate::scan::{Scanner, StreamId};
 use crate::trigger::build_pattern_trigger;
 
 pub mod signal;
@@ -86,8 +86,11 @@ pub async fn run(opts: WrapOptions) -> Result<ExitStatus> {
     let shutdown_state = Arc::new(ShutdownState::default());
 
     // Single shared scan channel, fed by all tee tasks (1 in PTY mode, 2
-    // in pipe mode).
-    let (scan_tx, scan_rx) = mpsc::channel::<Bytes>(CHANNEL_CAPACITY);
+    // in pipe mode). Each chunk carries its `StreamId` so the scanner
+    // can route bytes into the right per-stream line buffer — without
+    // this tagging, a partial stdout line and a stderr chunk would
+    // splice together and produce phantom matches.
+    let (scan_tx, scan_rx) = mpsc::channel::<(StreamId, Bytes)>(CHANNEL_CAPACITY);
 
     // Spawn the scanner consumer task before any tee task so we never
     // block tee on a not-yet-ready scanner.
@@ -197,8 +200,8 @@ pub async fn run(opts: WrapOptions) -> Result<ExitStatus> {
     // without a `\n`.
     let _ = scan_consumer.await;
 
-    // Now flush any trailing partial line and dispatch its matches.
-    let final_events = scanner.flush();
+    // Now flush trailing partial lines for every stream and dispatch.
+    let final_events = scanner.flush_all();
     if !final_events.is_empty() {
         dispatch_events(
             &final_events,
@@ -321,8 +324,12 @@ fn signal_name_to_signum(name: &str) -> Option<i32> {
 }
 
 /// Tee a tokio AsyncRead source (used in pipes mode for child stdout/stderr).
-async fn async_tee<R>(src: R, sink: SinkKind, scan_tx: mpsc::Sender<Bytes>, drops: Drops)
-where
+async fn async_tee<R>(
+    src: R,
+    sink: SinkKind,
+    scan_tx: mpsc::Sender<(StreamId, Bytes)>,
+    drops: Drops,
+) where
     R: tokio::io::AsyncRead + Unpin + Send,
 {
     match sink {
@@ -335,13 +342,14 @@ async fn async_tee_loop<R, W>(
     mut src: R,
     mut writer: W,
     sink: SinkKind,
-    scan_tx: mpsc::Sender<Bytes>,
+    scan_tx: mpsc::Sender<(StreamId, Bytes)>,
     drops: Drops,
 ) where
     R: tokio::io::AsyncRead + Unpin + Send,
     W: tokio::io::AsyncWriteExt + Unpin,
 {
     use tokio::io::AsyncReadExt;
+    let stream_id: StreamId = sink.into();
     let mut buf = vec![0u8; 8 * 1024];
     loop {
         match src.read(&mut buf).await {
@@ -351,7 +359,10 @@ async fn async_tee_loop<R, W>(
                     break;
                 }
                 let _ = writer.flush().await;
-                if scan_tx.try_send(Bytes::copy_from_slice(&buf[..n])).is_err() {
+                if scan_tx
+                    .try_send((stream_id, Bytes::copy_from_slice(&buf[..n])))
+                    .is_err()
+                {
                     drops.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 }
             }
@@ -434,7 +445,7 @@ mod conversion_tests {
 
 #[allow(clippy::too_many_arguments)]
 async fn scan_consumer_task(
-    mut rx: mpsc::Receiver<Bytes>,
+    mut rx: mpsc::Receiver<(StreamId, Bytes)>,
     scanner: Arc<Scanner>,
     patterns: Arc<Vec<Pattern>>,
     debouncers: Arc<Vec<Debouncer>>,
@@ -442,8 +453,8 @@ async fn scan_consumer_task(
     default_backend_id: String,
     last_pattern_fire: Arc<StdMutex<Option<Instant>>>,
 ) {
-    while let Some(chunk) = rx.recv().await {
-        let events = scanner.feed(&chunk);
+    while let Some((stream, chunk)) = rx.recv().await {
+        let events = scanner.feed(stream, &chunk);
         if events.is_empty() {
             continue;
         }
