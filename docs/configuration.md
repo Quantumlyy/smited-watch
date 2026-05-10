@@ -6,7 +6,7 @@ Configuration lives in a single TOML file: `watch.toml`.
 
 | Platform | Default path |
 |----------|--------------|
-| Linux/macOS | `$XDG_CONFIG_HOME/smited/watch.toml` (falls back to `~/.config/smited/watch.toml` when XDG is unset) |
+| Linux/macOS | `$XDG_CONFIG_HOME/smited/watch.toml` (falls back to `~/.config/smited/watch.toml` when `XDG_CONFIG_HOME` is unset or empty) |
 | Windows | `%APPDATA%\smited\watch.toml` |
 
 Override with `--config <path>` or `$SMITED_WATCH_CONFIG`.

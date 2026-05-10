@@ -26,7 +26,7 @@ cargo install --git https://github.com/Quantumlyy/smited-watch
 smited-watch -- npm run dev
 
 # Edit the config to point at your daemon and tweak the patterns.
-$EDITOR "$XDG_CONFIG_HOME/smited/watch.toml"   # or ~/.config/smited/watch.toml
+$EDITOR "${XDG_CONFIG_HOME:-$HOME/.config}/smited/watch.toml"
 
 # Run again. Now matches on `error TS\d+` (and the other defaults) fire
 # the configured sensations on the daemon.
@@ -104,7 +104,7 @@ directory:
 
 | Platform | Default path |
 |----------|--------------|
-| Linux/macOS | `$XDG_CONFIG_HOME/smited/watch.toml` (falls back to `~/.config/smited/watch.toml` when XDG is unset) |
+| Linux/macOS | `$XDG_CONFIG_HOME/smited/watch.toml` (falls back to `~/.config/smited/watch.toml` when `XDG_CONFIG_HOME` is unset or empty) |
 | Windows | `%APPDATA%\smited\watch.toml` |
 
 If the file doesn't exist when you first run `smited-watch`, it writes a

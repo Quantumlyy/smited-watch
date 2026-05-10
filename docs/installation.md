@@ -74,7 +74,7 @@ smited-watch -- echo hello   # should print "hello"
 
 ```sh
 cargo uninstall smited-watch
-rm -rf "$XDG_CONFIG_HOME/smited"   # or ~/.config/smited on Linux/macOS
+rm -rf "${XDG_CONFIG_HOME:-$HOME/.config}/smited"   # Linux/macOS
 ```
 
 (On Windows, remove `%APPDATA%\smited\` instead.)
