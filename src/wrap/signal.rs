@@ -151,7 +151,7 @@ pub fn install_handlers(
 /// than UB. We ignore the return value — if the group has already
 /// exited, ESRCH is fine.
 #[cfg(unix)]
-fn forward_signal(target: SignalTarget, signum: i32) {
+pub fn forward_signal(target: SignalTarget, signum: i32) {
     match target {
         SignalTarget::Pid(pid) => {
             debug!(pid, signum, "smited-watch: forwarding signal to child PID");

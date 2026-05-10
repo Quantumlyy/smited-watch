@@ -34,7 +34,7 @@ use std::thread::JoinHandle;
 
 use bytes::Bytes;
 use tokio::io::AsyncWriteExt;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, Notify};
 use tracing::debug;
 
 use crate::scan::StreamId;
@@ -110,18 +110,29 @@ pub fn spawn_blocking_reader(
 /// On `scan_tx` being full, the chunk is dropped and `drops` is
 /// incremented; the chunk has already been written to the parent stream
 /// at that point so the user sees no degradation.
+///
+/// On the parent write failing with `BrokenPipe` (downstream consumer
+/// exited — e.g. `smited-watch -- yes | head -n1`), the task notifies
+/// `pipe_broken` and exits the loop. The orchestrator's watcher then
+/// forwards SIGPIPE to the child so it dies promptly, mirroring the
+/// shell's natural pipe-close behaviour.
 pub async fn tee_task(
     rx: mpsc::Receiver<Bytes>,
     sink: SinkKind,
     scan_tx: mpsc::Sender<(StreamId, Bytes)>,
     drops: Drops,
+    pipe_broken: Arc<Notify>,
 ) {
     // tokio::io::Stdout and Stderr have different concrete types — we
     // monomorphise on each side rather than try to dyn-trait them, since
     // `AsyncWriteExt` isn't object-safe.
     match sink {
-        SinkKind::Stdout => tee_loop(rx, tokio::io::stdout(), sink, scan_tx, drops).await,
-        SinkKind::Stderr => tee_loop(rx, tokio::io::stderr(), sink, scan_tx, drops).await,
+        SinkKind::Stdout => {
+            tee_loop(rx, tokio::io::stdout(), sink, scan_tx, drops, pipe_broken).await
+        }
+        SinkKind::Stderr => {
+            tee_loop(rx, tokio::io::stderr(), sink, scan_tx, drops, pipe_broken).await
+        }
     }
 }
 
@@ -131,6 +142,7 @@ async fn tee_loop<W>(
     sink: SinkKind,
     scan_tx: mpsc::Sender<(StreamId, Bytes)>,
     drops: Drops,
+    pipe_broken: Arc<Notify>,
 ) where
     W: AsyncWriteExt + Unpin,
 {
@@ -138,12 +150,29 @@ async fn tee_loop<W>(
     while let Some(chunk) = rx.recv().await {
         // Write to parent first — back-pressure on slow terminal naturally
         // throttles the child via OS buffer fill.
-        if let Err(e) = writer.write_all(&chunk).await {
-            debug!(error = %e, ?sink, "tee: parent write failed; dropping chunk");
-            // Continue draining rx so the reader thread can still exit.
-            continue;
+        match writer.write_all(&chunk).await {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => {
+                // Downstream pipeline consumer (`| head -n1`) exited. We
+                // can't keep forwarding bytes anywhere useful; tell the
+                // orchestrator to SIGPIPE the child and stop draining
+                // ourselves. Reader thread / async reader will exit on
+                // its next `tx.send()` failure.
+                debug!(?sink, "tee: parent write got BrokenPipe; halting tee");
+                pipe_broken.notify_one();
+                return;
+            }
+            Err(e) => {
+                debug!(error = %e, ?sink, "tee: parent write failed; dropping chunk");
+                continue;
+            }
         }
         if let Err(e) = writer.flush().await {
+            if e.kind() == std::io::ErrorKind::BrokenPipe {
+                debug!(?sink, "tee: parent flush got BrokenPipe; halting tee");
+                pipe_broken.notify_one();
+                return;
+            }
             debug!(error = %e, ?sink, "tee: parent flush failed");
         }
         // Then fan out to scanner. Drop on full — passthrough latency wins.

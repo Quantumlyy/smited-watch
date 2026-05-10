@@ -348,6 +348,53 @@ fn child_reading_stdin_does_not_get_sigttin_when_stdin_is_a_tty() {
     );
 }
 
+#[cfg(unix)]
+#[test]
+fn pipeline_close_makes_wrapper_exit_promptly() {
+    // The reviewer's #1 scenario: `smited-watch -- yes | head -n1`. head
+    // exits after one line, closing the wrapper's stdout pipe. Pre-fix
+    // the wrapper kept reading from `yes` and dropping the bytes
+    // forever; post-fix, BrokenPipe on our parent write triggers a
+    // SIGPIPE forward to the child so it dies and the wrapper exits.
+    use std::io::{BufRead, BufReader};
+    use std::process::Stdio;
+
+    let (_dir, cfg) = empty_config();
+    let mut child = binary(&cfg)
+        .stdout(Stdio::piped())
+        .arg("--")
+        .arg("yes")
+        .arg("hello")
+        .spawn()
+        .expect("spawn smited-watch");
+    let stdout = child.stdout.take().expect("wrapper stdout pipe");
+
+    // Consume one line, drop the reader → the wrapper's stdout pipe
+    // closes. This is what `| head -n1` does.
+    {
+        let mut reader = BufReader::new(stdout);
+        let mut line = String::new();
+        reader
+            .read_line(&mut line)
+            .expect("read at least one line from yes");
+        assert!(line.starts_with("hello"), "got line {line:?}");
+    }
+
+    let started = std::time::Instant::now();
+    let status = child.wait().expect("wait on smited-watch");
+    let elapsed = started.elapsed();
+
+    // Pre-fix the wrapper would hang forever (or until the test killed
+    // it). The fix delivers SIGPIPE to `yes`, which dies, and the
+    // wrapper unwinds in well under a second on a fast machine. Allow
+    // 10s headroom for slow CI; a regression makes this test time out.
+    assert!(
+        elapsed < std::time::Duration::from_secs(10),
+        "wrapper took {elapsed:?} to exit after downstream pipe close — \
+         BrokenPipe propagation regressed; status={status:?}"
+    );
+}
+
 #[test]
 fn no_command_prints_help_and_exits_nonzero() {
     let (_dir, cfg) = empty_config();

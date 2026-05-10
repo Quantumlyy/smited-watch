@@ -34,7 +34,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use bytes::Bytes;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, Notify};
 use tracing::{debug, warn};
 
 use crate::client::TriggerClient;
@@ -84,6 +84,12 @@ pub async fn run(opts: WrapOptions) -> Result<ExitStatus> {
     let last_pattern_fire: Arc<StdMutex<Option<Instant>>> = Arc::new(StdMutex::new(None));
     let scan_drops: Drops = Arc::new(AtomicU64::new(0));
     let shutdown_state = Arc::new(ShutdownState::default());
+    // Notified by tee tasks when their parent-stdout/stderr write fails
+    // with `BrokenPipe` — i.e. the downstream pipeline consumer
+    // (`| head -n1`, etc.) has exited. The orchestrator's pipe-broken
+    // watcher then forwards SIGPIPE to the child so the child dies
+    // promptly instead of writing into the void forever.
+    let pipe_broken: Arc<Notify> = Arc::new(Notify::new());
 
     // Single shared scan channel, fed by all tee tasks (1 in PTY mode, 2
     // in pipe mode). Each chunk carries its `StreamId` so the scanner
@@ -127,6 +133,7 @@ pub async fn run(opts: WrapOptions) -> Result<ExitStatus> {
                 SinkKind::Stdout,
                 scan_tx.clone(),
                 scan_drops.clone(),
+                pipe_broken.clone(),
             )));
 
             // PTY-mode children are session leaders via portable-pty's
@@ -134,6 +141,7 @@ pub async fn run(opts: WrapOptions) -> Result<ExitStatus> {
             let target = SignalTarget::new(pty.child.process_id(), true);
             let master_arc: Arc<MasterPtyHandle> = Arc::new(MasterPtyHandle::new(pty.master));
             signal_aborts = install_handlers(target, Some(master_arc), shutdown_state.clone())?;
+            let pipe_watcher = spawn_pipe_broken_watcher(pipe_broken.clone(), target);
 
             // Wait for the child on a blocking thread (portable-pty's
             // `Child` is sync). The Child handle is owned by this
@@ -145,6 +153,7 @@ pub async fn run(opts: WrapOptions) -> Result<ExitStatus> {
             })
             .await??;
             exit_status = exit;
+            pipe_watcher.abort();
         }
         ChildIo::Pipes(mut pipes) => {
             // Pipes mode: child stdout & stderr are already tokio AsyncRead
@@ -152,24 +161,28 @@ pub async fn run(opts: WrapOptions) -> Result<ExitStatus> {
             let scan_tx_a = scan_tx.clone();
             let drops_a = scan_drops.clone();
             let stdout = pipes.stdout;
+            let pb_a = pipe_broken.clone();
             tee_tasks.push(tokio::spawn(async move {
-                async_tee(stdout, SinkKind::Stdout, scan_tx_a, drops_a).await;
+                async_tee(stdout, SinkKind::Stdout, scan_tx_a, drops_a, pb_a).await;
             }));
             let scan_tx_b = scan_tx.clone();
             let drops_b = scan_drops.clone();
             let stderr = pipes.stderr;
+            let pb_b = pipe_broken.clone();
             tee_tasks.push(tokio::spawn(async move {
-                async_tee(stderr, SinkKind::Stderr, scan_tx_b, drops_b).await;
+                async_tee(stderr, SinkKind::Stderr, scan_tx_b, drops_b, pb_b).await;
             }));
 
             // Pipe-mode children are pgrp leaders only when stdin was
             // non-TTY at spawn time (see spawn_pipes for the rationale).
             let target = SignalTarget::new(pipes.child.id(), pipes.pgrp_leader);
             signal_aborts = install_handlers(target, None, shutdown_state.clone())?;
+            let pipe_watcher = spawn_pipe_broken_watcher(pipe_broken.clone(), target);
 
             // The child handle stays in this scope; we don't share it
             // with the signal handler, which forwards via the saved PID.
             exit_status = pipes.child.wait().await?;
+            pipe_watcher.abort();
         }
     }
 
@@ -252,6 +265,33 @@ pub async fn run(opts: WrapOptions) -> Result<ExitStatus> {
     Ok(exit_status)
 }
 
+/// Watch for the "downstream pipeline consumer closed our output" signal
+/// from a tee task and, when it fires, forward SIGPIPE to the child so
+/// it dies promptly rather than getting EPIPE on its next write attempt
+/// (which for a quiet child could be much later, leaving the wrapper
+/// blocked on `child.wait()` forever).
+///
+/// The handle returned by this function should be aborted once the child
+/// has exited so the watcher doesn't leak past the wrapper's lifetime.
+/// On platforms without `forward_signal` support (Windows in v0.1) the
+/// watcher logs the broken-pipe event and the wrapper still relies on
+/// the OS pipe-buffer fill + child's own handling to wind things down.
+fn spawn_pipe_broken_watcher(
+    pipe_broken: Arc<Notify>,
+    target: Option<self::signal::SignalTarget>,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        pipe_broken.notified().await;
+        debug!("pipe-broken watcher: downstream consumer closed our output");
+        #[cfg(unix)]
+        if let Some(t) = target {
+            self::signal::forward_signal(t, libc::SIGPIPE);
+        }
+        #[cfg(not(unix))]
+        let _ = target;
+    })
+}
+
 /// Convert a [`portable_pty::ExitStatus`] into a [`std::process::ExitStatus`]
 /// the caller can `.code()` and (on Unix) `.signal()` on.
 ///
@@ -324,17 +364,27 @@ fn signal_name_to_signum(name: &str) -> Option<i32> {
 }
 
 /// Tee a tokio AsyncRead source (used in pipes mode for child stdout/stderr).
+///
+/// Mirrors [`tee_task`] for the async-read case: forwards the source's
+/// bytes to the parent stream, fans out to the scanner, and on a parent
+/// `BrokenPipe` notifies `pipe_broken` so the orchestrator can SIGPIPE
+/// the child.
 async fn async_tee<R>(
     src: R,
     sink: SinkKind,
     scan_tx: mpsc::Sender<(StreamId, Bytes)>,
     drops: Drops,
+    pipe_broken: Arc<Notify>,
 ) where
     R: tokio::io::AsyncRead + Unpin + Send,
 {
     match sink {
-        SinkKind::Stdout => async_tee_loop(src, tokio::io::stdout(), sink, scan_tx, drops).await,
-        SinkKind::Stderr => async_tee_loop(src, tokio::io::stderr(), sink, scan_tx, drops).await,
+        SinkKind::Stdout => {
+            async_tee_loop(src, tokio::io::stdout(), sink, scan_tx, drops, pipe_broken).await
+        }
+        SinkKind::Stderr => {
+            async_tee_loop(src, tokio::io::stderr(), sink, scan_tx, drops, pipe_broken).await
+        }
     }
 }
 
@@ -344,6 +394,7 @@ async fn async_tee_loop<R, W>(
     sink: SinkKind,
     scan_tx: mpsc::Sender<(StreamId, Bytes)>,
     drops: Drops,
+    pipe_broken: Arc<Notify>,
 ) where
     R: tokio::io::AsyncRead + Unpin + Send,
     W: tokio::io::AsyncWriteExt + Unpin,
@@ -354,18 +405,32 @@ async fn async_tee_loop<R, W>(
     loop {
         match src.read(&mut buf).await {
             Ok(0) => break,
-            Ok(n) => {
-                if writer.write_all(&buf[..n]).await.is_err() {
-                    break;
+            Ok(n) => match writer.write_all(&buf[..n]).await {
+                Ok(()) => {
+                    if let Err(e) = writer.flush().await {
+                        if e.kind() == std::io::ErrorKind::BrokenPipe {
+                            debug!(?sink, "async tee: parent flush BrokenPipe");
+                            pipe_broken.notify_one();
+                            return;
+                        }
+                    }
+                    if scan_tx
+                        .try_send((stream_id, Bytes::copy_from_slice(&buf[..n])))
+                        .is_err()
+                    {
+                        drops.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    }
                 }
-                let _ = writer.flush().await;
-                if scan_tx
-                    .try_send((stream_id, Bytes::copy_from_slice(&buf[..n])))
-                    .is_err()
-                {
-                    drops.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => {
+                    debug!(?sink, "async tee: parent write BrokenPipe; halting tee");
+                    pipe_broken.notify_one();
+                    return;
                 }
-            }
+                Err(e) => {
+                    debug!(error = %e, ?sink, "async tee: parent write failed; dropping chunk");
+                    continue;
+                }
+            },
             Err(e) => {
                 debug!(error = %e, ?sink, "async tee: read error");
                 break;
