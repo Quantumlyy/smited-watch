@@ -249,3 +249,116 @@ strategy = "carrier-pigeon"
         "error should mention the bad strategy, got: {msg}"
     );
 }
+
+// ─────────────────────────────────────────────────────────────────────────
+// XDG_CONFIG_HOME resolution
+//
+// These tests mutate process env vars, so they must run serialised.
+// Cargo's test runner parallelises by default; without a lock, a sibling
+// test reading XDG_CONFIG_HOME would see whatever the previous test left
+// behind. Tests live in this single test binary, sharing a process —
+// the lock here is sufficient.
+//
+// `unwrap_or_else(|e| e.into_inner())` lets us recover from a panicking
+// earlier test poisoning the mutex; otherwise one bad test would block
+// every other XDG-related test in the same `cargo test` invocation.
+// ─────────────────────────────────────────────────────────────────────────
+
+#[cfg(unix)]
+fn env_lock() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    LOCK.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// Snapshot/restore guard for the small set of env vars these tests
+/// touch — so even if a test panics mid-way, the next one starts from
+/// the inherited environment.
+#[cfg(unix)]
+struct EnvRestore {
+    xdg: Option<std::ffi::OsString>,
+    home: Option<std::ffi::OsString>,
+}
+
+#[cfg(unix)]
+impl EnvRestore {
+    fn capture() -> Self {
+        Self {
+            xdg: std::env::var_os("XDG_CONFIG_HOME"),
+            home: std::env::var_os("HOME"),
+        }
+    }
+}
+
+#[cfg(unix)]
+impl Drop for EnvRestore {
+    fn drop(&mut self) {
+        // SAFETY: env mutation is unsafe in 2024-edition std; here we're
+        // explicitly serialising via env_lock() so concurrent reads
+        // can't observe partially-updated state.
+        unsafe {
+            match &self.xdg {
+                Some(v) => std::env::set_var("XDG_CONFIG_HOME", v),
+                None => std::env::remove_var("XDG_CONFIG_HOME"),
+            }
+            match &self.home {
+                Some(v) => std::env::set_var("HOME", v),
+                None => std::env::remove_var("HOME"),
+            }
+        }
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn xdg_config_home_set_and_non_empty_is_used_directly() {
+    let _g = env_lock();
+    let _r = EnvRestore::capture();
+    unsafe {
+        std::env::set_var("XDG_CONFIG_HOME", "/custom/xdg");
+    }
+    let path = config::default_config_path().expect("default path");
+    assert_eq!(path, PathBuf::from("/custom/xdg/smited/watch.toml"));
+}
+
+#[cfg(unix)]
+#[test]
+fn xdg_config_home_unset_falls_back_to_home_config() {
+    let _g = env_lock();
+    let _r = EnvRestore::capture();
+    unsafe {
+        std::env::remove_var("XDG_CONFIG_HOME");
+        std::env::set_var("HOME", "/home/test");
+    }
+    let path = config::default_config_path().expect("default path");
+    assert_eq!(path, PathBuf::from("/home/test/.config/smited/watch.toml"));
+}
+
+/// The bug fixed in this round: `XDG_CONFIG_HOME=""` (set but empty)
+/// was being passed straight to `PathBuf::from`, producing the relative
+/// path `smited/watch.toml` and resolving against the current working
+/// directory — so smited-watch would read/write a different config
+/// depending on which directory it was launched from. The XDG spec
+/// requires empty-equals-unset for exactly this reason.
+#[cfg(unix)]
+#[test]
+fn xdg_config_home_empty_falls_back_to_home_config() {
+    let _g = env_lock();
+    let _r = EnvRestore::capture();
+    unsafe {
+        std::env::set_var("XDG_CONFIG_HOME", "");
+        std::env::set_var("HOME", "/home/test");
+    }
+    let path = config::default_config_path().expect("default path");
+    assert_eq!(
+        path,
+        PathBuf::from("/home/test/.config/smited/watch.toml"),
+        "empty XDG_CONFIG_HOME must fall back to $HOME/.config per XDG spec, \
+         not produce a relative path"
+    );
+    // Belt-and-braces: the path is absolute (no relative-path leak).
+    assert!(
+        path.is_absolute(),
+        "default config path must be absolute; got {}",
+        path.display()
+    );
+}

@@ -207,20 +207,13 @@ pub fn write_template(path: &Path) -> Result<()> {
 
 /// Compute the default config path per the spec.
 ///
-/// * Linux/macOS: `$XDG_CONFIG_HOME/smited/watch.toml` if set, else
-///   `$HOME/.config/smited/watch.toml`.
+/// * Linux/macOS: `$XDG_CONFIG_HOME/smited/watch.toml` if XDG_CONFIG_HOME is
+///   set *and non-empty*, else `$HOME/.config/smited/watch.toml`.
 /// * Windows: `%APPDATA%\smited\watch.toml`.
 pub fn default_config_path() -> Result<PathBuf> {
     #[cfg(unix)]
     {
-        let base = if let Some(xdg) = std::env::var_os("XDG_CONFIG_HOME") {
-            PathBuf::from(xdg)
-        } else {
-            let home = std::env::var_os("HOME")
-                .ok_or_else(|| anyhow!("$HOME is unset; cannot compute default config path"))?;
-            PathBuf::from(home).join(".config")
-        };
-        Ok(base.join("smited").join("watch.toml"))
+        Ok(xdg_config_home()?.join("smited").join("watch.toml"))
     }
     #[cfg(windows)]
     {
@@ -232,4 +225,32 @@ pub fn default_config_path() -> Result<PathBuf> {
     {
         Err(anyhow!("unsupported platform for default config path"))
     }
+}
+
+/// Resolve the XDG config home base directory.
+///
+/// Per the XDG Base Directory specification:
+/// > If $XDG_CONFIG_HOME is either not set or empty, a default equal to
+/// > $HOME/.config should be used.
+///
+/// The "or empty" half is what this helper exists for. `std::env::var_os`
+/// returns `Some(OsString)` even when the variable is exported as the empty
+/// string (`export XDG_CONFIG_HOME=""`), and a naive `PathBuf::from(...)`
+/// of that empty value plus `.join("smited/watch.toml")` produces the
+/// *relative* path `smited/watch.toml`, which then resolves against the
+/// current working directory. The wrapper would then read and write a
+/// different config file depending on which directory it was launched
+/// from — a recipe for silent confusion.
+#[cfg(unix)]
+fn xdg_config_home() -> Result<PathBuf> {
+    if let Some(xdg) = std::env::var_os("XDG_CONFIG_HOME") {
+        // OsStr::is_empty exists since 1.65 and avoids a UTF-8 round-trip
+        // on values that aren't valid UTF-8 (rare but possible in env vars).
+        if !xdg.is_empty() {
+            return Ok(PathBuf::from(xdg));
+        }
+    }
+    let home = std::env::var_os("HOME")
+        .ok_or_else(|| anyhow!("$HOME is unset; cannot compute default config path"))?;
+    Ok(PathBuf::from(home).join(".config"))
 }
