@@ -1,0 +1,897 @@
+// smited.v1 — wire format for the smited haptic/feedback daemon.
+//
+// Backends register at runtime and advertise their own zones, parameter
+// schemas, concurrency models, and calibration state, so clients never
+// hardcode hardware-specific knowledge into the wire format. Sensations
+// are either pre-registered in the daemon's library (looked up by name)
+// or constructed inline by the client. Cross-backend logical mapping
+// (e.g. "compile_error_severe" -> whatever backend is loaded) is the
+// multiplexer's job, not the daemon's; the schema reflects that.
+
+syntax = "proto3";
+
+package smited.v1;
+
+import "buf/validate/validate.proto";
+import "google/protobuf/duration.proto";
+import "google/protobuf/struct.proto";
+import "google/protobuf/timestamp.proto";
+
+option csharp_namespace = "Smited.V1";
+option go_package = "github.com/quantumly-labs/smited-protos/gen/go/smited/v1;smitedv1";
+
+// =============================================================================
+// Service
+// =============================================================================
+
+// SmitedService is the daemon's gRPC API: capability discovery, sensation
+// triggering, stop, sensation library management, and health.
+service SmitedService {
+  // ListBackends returns every registered backend, optionally filtered by
+  // capability tag.
+  rpc ListBackends(ListBackendsRequest) returns (ListBackendsResponse);
+
+  // DescribeBackend returns the full capability description for one
+  // backend: zones, parameter schema, concurrency model, calibration.
+  rpc DescribeBackend(DescribeBackendRequest) returns (DescribeBackendResponse);
+
+  // Trigger plays a sensation on the named backend (or auto-routes when
+  // backend_id is empty). Sensations are looked up by name from the
+  // library or constructed inline.
+  rpc Trigger(TriggerRequest) returns (TriggerResponse);
+
+  // Stop cancels one specific sensation, every sensation on a backend,
+  // or every active sensation across the daemon.
+  rpc Stop(StopRequest) returns (StopResponse);
+
+  // ListSensations returns the registered-sensation library, optionally
+  // filtered by backend and tags.
+  rpc ListSensations(ListSensationsRequest) returns (ListSensationsResponse);
+
+  // RegisterSensation adds (or replaces, with overwrite=true) a sensation
+  // in the daemon's library. The targeted backend MUST advertise the
+  // "sensation_registry_mutable" capability; otherwise the daemon
+  // returns INVALID_ARGUMENT.
+  rpc RegisterSensation(RegisterSensationRequest) returns (RegisterSensationResponse);
+
+  // UnregisterSensation removes a sensation from the library. The
+  // targeted backend MUST advertise the "sensation_registry_mutable"
+  // capability; otherwise the daemon returns INVALID_ARGUMENT.
+  rpc UnregisterSensation(UnregisterSensationRequest) returns (UnregisterSensationResponse);
+
+  // Health reports daemon liveness and the currently-registered backend
+  // set.
+  rpc Health(HealthRequest) returns (HealthResponse);
+
+  // SubscribeEvents streams sensation and backend lifecycle events as
+  // they happen. The server keeps the stream open until the client
+  // closes it. The streamed message is named Event rather than
+  // SubscribeEventsResponse because it is the actual lifecycle unit,
+  // not a one-shot response wrapper.
+  // buf:lint:ignore RPC_RESPONSE_STANDARD_NAME
+  rpc SubscribeEvents(SubscribeEventsRequest) returns (stream Event);
+}
+
+// =============================================================================
+// Capability discovery
+// =============================================================================
+
+// BackendStatus is the operational state of a registered backend.
+enum BackendStatus {
+  BACKEND_STATUS_UNSPECIFIED = 0;
+  BACKEND_STATUS_READY = 1;
+  BACKEND_STATUS_DISCONNECTED = 2;
+  BACKEND_STATUS_DEGRADED = 3;
+  BACKEND_STATUS_ERROR = 4;
+}
+
+// ConcurrencyPolicy describes how a backend handles overlapping triggers
+// once max_concurrent capacity is reached.
+enum ConcurrencyPolicy {
+  CONCURRENCY_POLICY_UNSPECIFIED = 0;
+  CONCURRENCY_POLICY_REJECT_NEW = 1;
+  CONCURRENCY_POLICY_CANCEL_OLDEST = 2;
+  CONCURRENCY_POLICY_PRIORITY = 3;
+  CONCURRENCY_POLICY_QUEUE = 4;
+}
+
+// ParameterType is the wire-level type of a backend-declared parameter.
+enum ParameterType {
+  PARAMETER_TYPE_UNSPECIFIED = 0;
+  PARAMETER_TYPE_NUMBER = 1;
+  PARAMETER_TYPE_BOOL = 2;
+  PARAMETER_TYPE_STRING = 3;
+  PARAMETER_TYPE_DURATION = 4;
+  PARAMETER_TYPE_ENUM = 5;
+}
+
+// ListBackendsRequest filters the visible backend list by capability tag.
+message ListBackendsRequest {
+  // Only return backends advertising every listed capability tag. Empty
+  // means "no filter".
+  repeated string with_capabilities = 1 [(buf.validate.field).repeated = {
+    max_items: 32
+    items: {
+      string: {
+        min_len: 1
+        max_len: 32
+        pattern: "^[a-z0-9][a-z0-9_-]*$"
+      }
+    }
+  }];
+}
+
+// ListBackendsResponse is the result of ListBackends.
+message ListBackendsResponse {
+  repeated BackendSummary backends = 1 [(buf.validate.field).repeated.max_items = 256];
+}
+
+// BackendSummary is the headline view of one registered backend.
+message BackendSummary {
+  // Unique runtime id assigned by the daemon at registration.
+  string id = 1 [(buf.validate.field).string = {
+    min_len: 1
+    max_len: 64
+    pattern: "^[a-z0-9][a-z0-9_-]*$"
+  }];
+
+  // Hardware family, e.g. "owo_skin", "haptic_belt". Distinguishes
+  // backend types regardless of which physical instance is connected.
+  string kind = 2 [(buf.validate.field).string = {
+    min_len: 1
+    max_len: 64
+    pattern: "^[a-z0-9][a-z0-9_-]*$"
+  }];
+
+  // Human-readable name suitable for UIs.
+  string display_name = 3 [(buf.validate.field).string = {
+    min_len: 1
+    max_len: 128
+  }];
+
+  // Operational status reported by the backend.
+  BackendStatus status = 4 [(buf.validate.field).enum = {
+    defined_only: true
+    not_in: [0]
+  }];
+
+  // Capability tags advertised by the backend, e.g. "vibration",
+  // "ems", "directional".
+  //
+  // Reserved tags with defined semantics:
+  //   "sensation_registry_mutable" — backend permits runtime
+  //     RegisterSensation / UnregisterSensation calls. Absent means
+  //     the library is read-only for this backend at runtime.
+  //
+  // Backends MAY advertise additional tags freely; the reserved set
+  // grows in additive minor versions of smited.v1.
+  repeated string capabilities = 5 [(buf.validate.field).repeated = {
+    max_items: 64
+    unique: true
+    items: {
+      string: {
+        min_len: 1
+        max_len: 32
+        pattern: "^[a-z0-9][a-z0-9_-]*$"
+      }
+    }
+  }];
+}
+
+// DescribeBackendRequest selects a backend to introspect.
+message DescribeBackendRequest {
+  string backend_id = 1 [(buf.validate.field).string = {
+    min_len: 1
+    max_len: 64
+    pattern: "^[a-z0-9][a-z0-9_-]*$"
+  }];
+}
+
+// DescribeBackendResponse is the full self-description of a backend.
+message DescribeBackendResponse {
+  // Headline metadata.
+  BackendSummary summary = 1 [(buf.validate.field).required = true];
+
+  // Spatial layout the backend addresses.
+  ZoneTopology zones = 2 [(buf.validate.field).required = true];
+
+  // Parameters accepted by Microsensation entries on this backend.
+  ParameterSchema parameters = 3 [(buf.validate.field).required = true];
+
+  // How the backend handles concurrent triggers.
+  ConcurrencyModel concurrency = 4 [(buf.validate.field).required = true];
+
+  // Calibration state, if the backend supports calibration.
+  CalibrationState calibration = 5;
+
+  // Free-form backend-defined metadata not modelled by this schema.
+  google.protobuf.Struct extras = 6;
+}
+
+// ZoneTopology describes the addressable zones and groupings a backend
+// exposes.
+message ZoneTopology {
+  repeated Zone zones = 1 [(buf.validate.field).repeated.max_items = 256];
+  repeated ZoneGroup groups = 2 [(buf.validate.field).repeated.max_items = 64];
+}
+
+// Zone is a single addressable target on a backend.
+message Zone {
+  string id = 1 [(buf.validate.field).string = {
+    min_len: 1
+    max_len: 64
+    pattern: "^[a-z0-9][a-z0-9_-]*$"
+  }];
+
+  string display_name = 2 [(buf.validate.field).string = {
+    min_len: 1
+    max_len: 128
+  }];
+
+  // Optional spatial hint for visualisation and routing.
+  PositionHint position = 3;
+
+  // Free-form tags for grouping and filtering, e.g. "front",
+  // "upper_body".
+  repeated string tags = 4 [(buf.validate.field).repeated = {
+    max_items: 16
+    items: {
+      string: {
+        min_len: 1
+        max_len: 32
+        pattern: "^[a-z0-9][a-z0-9_-]*$"
+      }
+    }
+  }];
+}
+
+// PositionHint is a unit-cube spatial coordinate describing roughly where
+// a zone sits on the body or device.
+message PositionHint {
+  float x = 1 [(buf.validate.field).float = {
+    gte: 0.0
+    lte: 1.0
+  }];
+  float y = 2 [(buf.validate.field).float = {
+    gte: 0.0
+    lte: 1.0
+  }];
+  float z = 3 [(buf.validate.field).float = {
+    gte: 0.0
+    lte: 1.0
+  }];
+
+  // Reference frame label, e.g. "body", "device_local".
+  string frame = 4 [(buf.validate.field).string.max_len = 64];
+}
+
+// ZoneGroup is a named bundle of zones addressable as one unit.
+message ZoneGroup {
+  string id = 1 [(buf.validate.field).string = {
+    min_len: 1
+    max_len: 64
+    pattern: "^[a-z0-9][a-z0-9_-]*$"
+  }];
+
+  string display_name = 2 [(buf.validate.field).string = {
+    min_len: 1
+    max_len: 128
+  }];
+
+  repeated string zone_ids = 3 [(buf.validate.field).repeated = {
+    min_items: 1
+    max_items: 256
+    items: {
+      string: {
+        min_len: 1
+        max_len: 64
+        pattern: "^[a-z0-9][a-z0-9_-]*$"
+      }
+    }
+  }];
+}
+
+// ParameterSchema is the set of parameter definitions a backend declares.
+// Microsensation parameter maps are validated server-side against it.
+message ParameterSchema {
+  repeated ParameterDef parameters = 1 [(buf.validate.field).repeated.max_items = 32];
+}
+
+// ParameterValue carries a typed parameter value matching the enclosing
+// ParameterDef.type. A typed oneof is preferred over google.protobuf.Value
+// because Value cannot represent google.protobuf.Duration and erases
+// enum-vs-string intent.
+message ParameterValue {
+  oneof value {
+    option (buf.validate.oneof).required = true;
+
+    // PARAMETER_TYPE_NUMBER.
+    double number = 1;
+
+    // PARAMETER_TYPE_BOOL.
+    bool bool_value = 2;
+
+    // PARAMETER_TYPE_STRING.
+    string string_value = 3;
+
+    // PARAMETER_TYPE_DURATION.
+    google.protobuf.Duration duration = 4;
+
+    // PARAMETER_TYPE_ENUM. Must appear in the enclosing
+    // ParameterDef.enum_values list.
+    string enum_value = 5 [(buf.validate.field).string = {
+      min_len: 1
+      max_len: 64
+      pattern: "^[a-z0-9][a-z0-9_-]*$"
+    }];
+  }
+}
+
+// ParameterDef defines one tunable parameter on a backend.
+message ParameterDef {
+  // enum_values must be non-empty when type=PARAMETER_TYPE_ENUM, so that
+  // clients can validate enum_value tokens against the declared set.
+  option (buf.validate.message).cel = {
+    id: "parameter_def.enum_values_required_when_enum"
+    expression:
+      "this.type != smited.v1.ParameterType.PARAMETER_TYPE_ENUM || "
+      "size(this.enum_values) > 0"
+    message: "enum_values must be non-empty when type is PARAMETER_TYPE_ENUM"
+  };
+
+  string name = 1 [(buf.validate.field).string = {
+    min_len: 1
+    max_len: 64
+    pattern: "^[a-z0-9][a-z0-9_-]*$"
+  }];
+
+  ParameterType type = 2 [(buf.validate.field).enum = {
+    defined_only: true
+    not_in: [0]
+  }];
+
+  // True if the parameter must be present on every Microsensation.
+  bool required = 3;
+
+  // Inclusive lower bound for numeric/duration parameters.
+  optional double min = 4;
+
+  // Inclusive upper bound for numeric/duration parameters.
+  optional double max = 5;
+
+  // Display unit, e.g. "ms", "Hz", "%".
+  optional string unit = 6 [(buf.validate.field).string.max_len = 32];
+
+  string description = 7 [(buf.validate.field).string.max_len = 1024];
+
+  // Default value used when a Microsensation omits this parameter. The
+  // selected ParameterValue oneof variant must match `type`.
+  ParameterValue default_value = 8;
+
+  // Allowed value tokens for PARAMETER_TYPE_ENUM. Empty for any other
+  // type. Tokens follow the IDENT shape so they survive serialisation
+  // through ParameterValue.enum_value unchanged.
+  repeated string enum_values = 9 [(buf.validate.field).repeated = {
+    max_items: 64
+    unique: true
+    items: {
+      string: {
+        min_len: 1
+        max_len: 64
+        pattern: "^[a-z0-9][a-z0-9_-]*$"
+      }
+    }
+  }];
+}
+
+// ConcurrencyModel describes a backend's concurrent-trigger behaviour.
+message ConcurrencyModel {
+  // 0 means single-shot only; otherwise the maximum overlapping
+  // sensations the backend can play simultaneously.
+  uint32 max_concurrent = 1 [(buf.validate.field).uint32.lte = 1024];
+
+  ConcurrencyPolicy policy = 2 [(buf.validate.field).enum = {
+    defined_only: true
+    not_in: [0]
+  }];
+}
+
+// CalibrationState reports whether a backend has been calibrated and
+// when.
+message CalibrationState {
+  bool calibrated = 1;
+  google.protobuf.Timestamp last_calibrated_at = 2;
+
+  // Backend-specific calibration metadata.
+  google.protobuf.Struct details = 3;
+}
+
+// =============================================================================
+// Triggering
+// =============================================================================
+
+// TriggerErrorCode classifies why a Trigger call was rejected.
+enum TriggerErrorCode {
+  TRIGGER_ERROR_CODE_UNSPECIFIED = 0;
+  TRIGGER_ERROR_CODE_BACKEND_NOT_FOUND = 1;
+  TRIGGER_ERROR_CODE_BACKEND_UNAVAILABLE = 2;
+  TRIGGER_ERROR_CODE_SENSATION_NOT_FOUND = 3;
+  TRIGGER_ERROR_CODE_INVALID_ZONE = 4;
+  TRIGGER_ERROR_CODE_INVALID_PARAMETER = 5;
+  TRIGGER_ERROR_CODE_NOT_CALIBRATED = 6;
+  TRIGGER_ERROR_CODE_RATE_LIMITED = 7;
+  TRIGGER_ERROR_CODE_INTERNAL = 8;
+}
+
+// TriggerRequest plays a pre-registered or inline sensation on a backend.
+message TriggerRequest {
+  // Target backend. Empty enables auto-routing in the multiplexer; when
+  // present, must match the IDENT pattern.
+  string backend_id = 1 [(buf.validate.field).string = {
+    max_len: 64
+    pattern: "^([a-z0-9][a-z0-9_-]*)?$"
+  }];
+
+  // Either look up a sensation by name in the daemon's library, or send
+  // a fully-defined inline sensation.
+  oneof sensation {
+    option (buf.validate.oneof).required = true;
+
+    string sensation_name = 2 [(buf.validate.field).string = {
+      min_len: 1
+      max_len: 64
+      pattern: "^[a-z0-9][a-z0-9_-]*$"
+    }];
+
+    InlineSensation inline = 3;
+  }
+
+  // Override zones the sensation plays on. Empty means "use the
+  // sensation's defaults".
+  repeated string zone_ids = 4 [(buf.validate.field).repeated = {
+    max_items: 64
+    items: {
+      string: {
+        min_len: 1
+        max_len: 64
+        pattern: "^[a-z0-9][a-z0-9_-]*$"
+      }
+    }
+  }];
+
+  // Per-call intensity scaling, 0..100. Unset means "use the
+  // sensation's default intensity"; an explicit 0 plays at zero
+  // amplitude.
+  optional uint32 intensity_scale = 5 [(buf.validate.field).uint32.lte = 100];
+
+  // Higher priority preempts lower under PRIORITY concurrency policy.
+  int32 priority = 6 [(buf.validate.field).int32 = {
+    gte: -1000
+    lte: 1000
+  }];
+
+  // Client-supplied trace id echoed back on lifecycle events.
+  string client_trace_id = 7 [(buf.validate.field).string = {
+    max_len: 128
+    pattern: "^[a-zA-Z0-9_-]*$"
+  }];
+}
+
+// InlineSensation is a sensation defined entirely inside a TriggerRequest
+// or RegisteredSensation.
+message InlineSensation {
+  repeated Microsensation microsensations = 1 [(buf.validate.field).repeated = {
+    min_items: 1
+    max_items: 32
+  }];
+}
+
+// Microsensation is one elementary unit of a sensation: a parameter map
+// validated server-side against the backend's ParameterSchema.
+message Microsensation {
+  // Parameter values keyed by ParameterDef.name. Each value's
+  // ParameterValue variant must match the corresponding ParameterDef.type.
+  map<string, ParameterValue> parameters = 1 [(buf.validate.field).map = {
+    max_pairs: 32
+    keys: {
+      string: {
+        min_len: 1
+        max_len: 64
+        pattern: "^[a-z0-9][a-z0-9_-]*$"
+      }
+    }
+  }];
+}
+
+// TriggerResponse reports whether a sensation was accepted and, if so,
+// the runtime id used to address it later.
+message TriggerResponse {
+  option (buf.validate.message).cel = {
+    id: "trigger_response.sensation_id_matches_accepted"
+    expression: "this.accepted == (this.sensation_id != '')"
+    message: "sensation_id must be non-empty when accepted is true and empty when accepted is false"
+  };
+  option (buf.validate.message).cel = {
+    id: "trigger_response.error_presence_matches_accepted"
+    expression: "this.accepted != has(this.error)"
+    message: "error must be set when accepted is false and absent when accepted is true"
+  };
+
+  bool accepted = 1;
+
+  // Daemon-assigned id; non-empty iff accepted=true.
+  string sensation_id = 2 [(buf.validate.field).string.max_len = 64];
+
+  // Echoed from the request for client-side correlation. Daemons MUST
+  // echo this whenever the request supplied one, including on rejected
+  // triggers (accepted=false), so failure paths remain traceable. The
+  // schema can't enforce request/response equality, but implementations
+  // are expected to.
+  string client_trace_id = 3 [(buf.validate.field).string = {
+    max_len: 128
+    pattern: "^[a-zA-Z0-9_-]*$"
+  }];
+
+  // Set when accepted=false; explains the rejection.
+  TriggerError error = 4;
+}
+
+// TriggerError is a structured rejection reason.
+message TriggerError {
+  TriggerErrorCode code = 1 [(buf.validate.field).enum = {
+    defined_only: true
+    not_in: [0]
+  }];
+
+  // Human-readable explanation suitable for surfacing to operators.
+  string message = 2 [(buf.validate.field).string.max_len = 512];
+
+  // Field path of the offending input, when applicable.
+  string field = 3 [(buf.validate.field).string.max_len = 256];
+}
+
+// =============================================================================
+// Stop
+// =============================================================================
+
+// StopRequest cancels active sensations: one specific id, all on a
+// backend, or everything.
+message StopRequest {
+  oneof target {
+    option (buf.validate.oneof).required = true;
+
+    // Cancel a single sensation by its runtime id.
+    string sensation_id = 1 [(buf.validate.field).string = {
+      min_len: 1
+      max_len: 64
+    }];
+
+    // Cancel every active sensation on a backend.
+    string backend_id = 2 [(buf.validate.field).string = {
+      min_len: 1
+      max_len: 64
+      pattern: "^[a-z0-9][a-z0-9_-]*$"
+    }];
+
+    // Cancel every active sensation across the daemon. Must be true
+    // when set.
+    bool all = 3 [(buf.validate.field).bool.const = true];
+  }
+}
+
+// StopResponse reports how many sensations were cancelled.
+message StopResponse {
+  uint32 stopped_count = 1;
+}
+
+// =============================================================================
+// Sensation library
+// =============================================================================
+
+// ListSensationsRequest filters the daemon's registered sensation library.
+message ListSensationsRequest {
+  // Restrict to one backend; empty means "all backends".
+  string backend_id = 1 [(buf.validate.field).string = {
+    max_len: 64
+    pattern: "^([a-z0-9][a-z0-9_-]*)?$"
+  }];
+
+  // Only return sensations carrying every listed tag.
+  repeated string tags = 2 [(buf.validate.field).repeated = {
+    max_items: 16
+    items: {
+      string: {
+        min_len: 1
+        max_len: 32
+        pattern: "^[a-z0-9][a-z0-9_-]*$"
+      }
+    }
+  }];
+}
+
+// ListSensationsResponse is the result of ListSensations.
+message ListSensationsResponse {
+  repeated RegisteredSensation sensations = 1 [(buf.validate.field).repeated.max_items = 4096];
+}
+
+// RegisteredSensation is a sensation stored in the daemon's library and
+// addressable by name.
+message RegisteredSensation {
+  // Library key; unique within (backend_id, name).
+  string name = 1 [(buf.validate.field).string = {
+    min_len: 1
+    max_len: 64
+    pattern: "^[a-z0-9][a-z0-9_-]*$"
+  }];
+
+  string backend_id = 2 [(buf.validate.field).string = {
+    min_len: 1
+    max_len: 64
+    pattern: "^[a-z0-9][a-z0-9_-]*$"
+  }];
+
+  string display_name = 3 [(buf.validate.field).string = {
+    min_len: 1
+    max_len: 128
+  }];
+
+  string description = 4 [(buf.validate.field).string.max_len = 1024];
+
+  repeated string tags = 5 [(buf.validate.field).repeated = {
+    max_items: 16
+    items: {
+      string: {
+        min_len: 1
+        max_len: 32
+        pattern: "^[a-z0-9][a-z0-9_-]*$"
+      }
+    }
+  }];
+
+  // Default zones to play on when a trigger does not override them.
+  repeated string default_zone_ids = 6 [(buf.validate.field).repeated = {
+    max_items: 64
+    items: {
+      string: {
+        min_len: 1
+        max_len: 64
+        pattern: "^[a-z0-9][a-z0-9_-]*$"
+      }
+    }
+  }];
+
+  // Default intensity scaling, 0..100. Unset means "no library default;
+  // fall back to the trigger or the backend"; an explicit 0 plays at
+  // zero amplitude.
+  optional uint32 default_intensity = 7 [(buf.validate.field).uint32.lte = 100];
+
+  // Authoring-time hint for UIs and schedulers.
+  google.protobuf.Duration estimated_duration = 8 [(buf.validate.field).duration = {
+    gte: {seconds: 0}
+    lte: {seconds: 300}
+  }];
+
+  google.protobuf.Timestamp registered_at = 9;
+
+  // The actual playable sensation body.
+  InlineSensation definition = 10 [(buf.validate.field).required = true];
+}
+
+// RegisterSensationRequest installs (or replaces) a sensation in the
+// library.
+message RegisterSensationRequest {
+  RegisteredSensation sensation = 1 [(buf.validate.field).required = true];
+
+  // When false, registration fails if a sensation with the same
+  // (backend_id, name) already exists.
+  bool overwrite = 2;
+}
+
+// RegisterSensationResponse reports the outcome.
+message RegisterSensationResponse {
+  option (buf.validate.message).cel = {
+    id: "register_sensation_response.error_presence_matches_registered"
+    expression: "this.registered != (this.error != '')"
+    message: "error must be non-empty when registered is false and empty when registered is true"
+  };
+
+  bool registered = 1;
+
+  // Human-readable failure reason when registered=false.
+  string error = 2 [(buf.validate.field).string.max_len = 512];
+}
+
+// UnregisterSensationRequest removes a sensation from the library.
+message UnregisterSensationRequest {
+  string backend_id = 1 [(buf.validate.field).string = {
+    min_len: 1
+    max_len: 64
+    pattern: "^[a-z0-9][a-z0-9_-]*$"
+  }];
+
+  string name = 2 [(buf.validate.field).string = {
+    min_len: 1
+    max_len: 64
+    pattern: "^[a-z0-9][a-z0-9_-]*$"
+  }];
+}
+
+// UnregisterSensationResponse reports whether anything was removed.
+message UnregisterSensationResponse {
+  bool unregistered = 1;
+}
+
+// =============================================================================
+// Health
+// =============================================================================
+
+// HealthRequest is empty; Health is a status probe with no parameters.
+message HealthRequest {}
+
+// HealthResponse summarises daemon liveness and the registered backend
+// set.
+message HealthResponse {
+  bool daemon_running = 1;
+  google.protobuf.Timestamp started_at = 2;
+  string version = 3 [(buf.validate.field).string.max_len = 64];
+
+  // Snapshot of currently-registered backends.
+  repeated BackendSummary backends = 4 [(buf.validate.field).repeated.max_items = 256];
+}
+
+// =============================================================================
+// Events
+// =============================================================================
+
+// EventKind classifies the lifecycle event carried by an Event message.
+enum EventKind {
+  EVENT_KIND_UNSPECIFIED = 0;
+  EVENT_KIND_SENSATION_STARTED = 1;
+  EVENT_KIND_SENSATION_COMPLETED = 2;
+  EVENT_KIND_SENSATION_CANCELLED = 3;
+  EVENT_KIND_BACKEND_REGISTERED = 4;
+  EVENT_KIND_BACKEND_DEREGISTERED = 5;
+  EVENT_KIND_BACKEND_STATUS_CHANGED = 6;
+  EVENT_KIND_CALIBRATION_CHANGED = 7;
+  EVENT_KIND_SENSATION_REGISTERED = 8;
+  EVENT_KIND_SENSATION_UNREGISTERED = 9;
+}
+
+// SubscribeEventsRequest narrows the event stream by kind and backend.
+message SubscribeEventsRequest {
+  // Limit the stream to these kinds. Empty means "every kind".
+  repeated EventKind kinds = 1 [(buf.validate.field).repeated = {
+    max_items: 16
+    items: {
+      enum: {
+        defined_only: true
+        not_in: [0]
+      }
+    }
+  }];
+
+  // Limit the stream to events from these backends. Empty means "every
+  // backend".
+  repeated string backend_ids = 2 [(buf.validate.field).repeated = {
+    max_items: 64
+    items: {
+      string: {
+        min_len: 1
+        max_len: 64
+        pattern: "^[a-z0-9][a-z0-9_-]*$"
+      }
+    }
+  }];
+}
+
+// Event is one entry on the SubscribeEvents stream. The detail oneof
+// carries the event-kind-specific payload; field numbers 10+ leave room
+// for additional non-oneof headline fields without renumbering.
+message Event {
+  // Each kind group must carry the matching detail variant:
+  //   SENSATION_{STARTED,COMPLETED,CANCELLED} -> sensation
+  //   BACKEND_{REGISTERED,DEREGISTERED,STATUS_CHANGED} -> backend
+  //   CALIBRATION_CHANGED -> calibration
+  //   SENSATION_{REGISTERED,UNREGISTERED} -> registry
+  // Adding a new EventKind requires extending this rule.
+  option (buf.validate.message).cel = {
+    id: "event.kind_matches_detail"
+    expression:
+      "((this.kind == smited.v1.EventKind.EVENT_KIND_SENSATION_STARTED || "
+      "  this.kind == smited.v1.EventKind.EVENT_KIND_SENSATION_COMPLETED || "
+      "  this.kind == smited.v1.EventKind.EVENT_KIND_SENSATION_CANCELLED) && has(this.sensation)) || "
+      "((this.kind == smited.v1.EventKind.EVENT_KIND_BACKEND_REGISTERED || "
+      "  this.kind == smited.v1.EventKind.EVENT_KIND_BACKEND_DEREGISTERED || "
+      "  this.kind == smited.v1.EventKind.EVENT_KIND_BACKEND_STATUS_CHANGED) && has(this.backend)) || "
+      "(this.kind == smited.v1.EventKind.EVENT_KIND_CALIBRATION_CHANGED && has(this.calibration)) || "
+      "((this.kind == smited.v1.EventKind.EVENT_KIND_SENSATION_REGISTERED || "
+      "  this.kind == smited.v1.EventKind.EVENT_KIND_SENSATION_UNREGISTERED) && has(this.registry))"
+    message: "detail oneof variant must match kind: SENSATION_* requires sensation, BACKEND_* requires backend, CALIBRATION_CHANGED requires calibration, SENSATION_(UN)REGISTERED requires registry"
+  };
+
+  google.protobuf.Timestamp timestamp = 1 [(buf.validate.field).required = true];
+
+  EventKind kind = 2 [(buf.validate.field).enum = {
+    defined_only: true
+    not_in: [0]
+  }];
+
+  // Backend the event originated from. Required because every v1
+  // EventKind is backend-scoped: sensation, calibration, and registry
+  // events all need backend_id to be addressable, since sensation
+  // names and calibration state are unique only within a backend.
+  // Loosen this to allow empty when (and if) a daemon-wide EventKind
+  // is introduced.
+  string backend_id = 3 [(buf.validate.field).string = {
+    min_len: 1
+    max_len: 64
+    pattern: "^[a-z0-9][a-z0-9_-]*$"
+  }];
+
+  oneof detail {
+    option (buf.validate.oneof).required = true;
+
+    SensationLifecycle sensation = 10;
+    BackendLifecycle backend = 11;
+    CalibrationChanged calibration = 12;
+    SensationRegistryChanged registry = 13;
+  }
+}
+
+// SensationLifecycle is the payload for SENSATION_STARTED, COMPLETED, and
+// CANCELLED events.
+message SensationLifecycle {
+  // Runtime sensation id assigned by the daemon at trigger time.
+  string sensation_id = 1 [(buf.validate.field).string = {
+    min_len: 1
+    max_len: 64
+  }];
+
+  // Library name when the sensation came from RegisterSensation; empty
+  // when the sensation was inline.
+  string sensation_name = 2 [(buf.validate.field).string = {
+    max_len: 64
+    pattern: "^([a-z0-9][a-z0-9_-]*)?$"
+  }];
+
+  // Echoed from the trigger that started the sensation.
+  string client_trace_id = 3 [(buf.validate.field).string = {
+    max_len: 128
+    pattern: "^[a-zA-Z0-9_-]*$"
+  }];
+
+  // Why the lifecycle event happened, e.g. "preempted_by_priority"
+  // for a CANCELLED event. Optional because START events generally have
+  // nothing to explain.
+  optional string reason = 4 [(buf.validate.field).string.max_len = 256];
+}
+
+// BackendLifecycle is the payload for BACKEND_REGISTERED, DEREGISTERED,
+// and STATUS_CHANGED events.
+message BackendLifecycle {
+  // The backend's summary at the moment the event fired. For
+  // DEREGISTERED events this is the final summary observed before
+  // teardown, including the last known status — daemons MUST NOT emit
+  // a synthesised UNSPECIFIED-equivalent status here.
+  BackendSummary summary = 1 [(buf.validate.field).required = true];
+
+  // Free-form context, e.g. "transport disconnected".
+  optional string reason = 2 [(buf.validate.field).string.max_len = 256];
+}
+
+// CalibrationChanged is the payload for CALIBRATION_CHANGED events.
+message CalibrationChanged {
+  CalibrationState new_state = 1 [(buf.validate.field).required = true];
+}
+
+// SensationRegistryChanged is the payload for SENSATION_REGISTERED and
+// SENSATION_UNREGISTERED events. The Event.kind discriminates between
+// the two; the payload carries only the (backend_id, name) coordinates
+// the change applies to (backend_id is on the enclosing Event).
+message SensationRegistryChanged {
+  string name = 1 [(buf.validate.field).string = {
+    min_len: 1
+    max_len: 64
+    pattern: "^[a-z0-9][a-z0-9_-]*$"
+  }];
+}

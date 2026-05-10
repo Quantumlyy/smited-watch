@@ -1219,6 +1219,7 @@ dependencies = [
  "dirs",
  "portable-pty",
  "prost",
+ "prost-types",
  "regex",
  "serde",
  "strip-ansi-escapes",
