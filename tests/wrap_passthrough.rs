@@ -211,6 +211,88 @@ fn quiet_flag_suppresses_banner_and_auto_create_notice() {
     );
 }
 
+#[cfg(unix)]
+#[test]
+fn sigterm_to_wrapper_kills_descendants_via_process_group() {
+    // Wrap a bash script that backgrounds a `sleep` and writes its PID
+    // to a file. After we send SIGTERM to the wrapper, the wrapper
+    // forwards SIGTERM to the child *process group*, so the descendant
+    // sleep must also die. Pre-fix, signalling only the bash PID would
+    // leave sleep orphaned.
+    //
+    // Why SIGTERM (not SIGINT) for this test: in non-interactive mode
+    // bash explicitly *ignores* SIGINT in backgrounded jobs (Bash man:
+    // "When job control is not in effect, asynchronous commands ignore
+    // SIGINT and SIGQUIT"). SIGTERM has no such carve-out, so it
+    // exercises pgrp forwarding cleanly without bash semantics in the way.
+    let (dir, cfg) = empty_config();
+    let pid_file = dir.path().join("sleep.pid");
+    let pid_file_str = pid_file.display().to_string();
+    // Use a long sleep so a regression — where SIGINT only reaches the
+    // immediate child and `sleep` runs to natural completion — would be
+    // observable as the test timing out, not as the test silently passing.
+    let script = format!("sleep 60 & echo $! > {pid_file_str}; wait");
+    let mut child = binary(&cfg)
+        .arg("--")
+        .arg("bash")
+        .arg("-c")
+        .arg(&script)
+        .spawn()
+        .expect("spawn smited-watch");
+    let wrapper_pid = child.id();
+
+    // Wait for bash to write the descendant PID.
+    let descendant_pid: i32 = {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            if let Ok(s) = std::fs::read_to_string(&pid_file) {
+                if let Ok(n) = s.trim().parse::<i32>() {
+                    break n;
+                }
+            }
+            if std::time::Instant::now() > deadline {
+                let _ = unsafe { libc::kill(wrapper_pid as libc::pid_t, libc::SIGKILL) };
+                let _ = child.wait();
+                panic!("sleep PID file never appeared; bash didn't start");
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+    };
+
+    let signaled_at = std::time::Instant::now();
+    unsafe {
+        libc::kill(wrapper_pid as libc::pid_t, libc::SIGTERM);
+    }
+    let _ = child.wait().expect("wait on smited-watch");
+    let elapsed = signaled_at.elapsed();
+
+    // Hard ceiling: if pgrp forwarding works, the wrapper should exit
+    // within a few seconds (signal delivery + 1s trigger drain). If we
+    // had signalled only the bash PID, bash's `wait` would block on the
+    // backgrounded sleep until sleep finishes naturally at 60s.
+    // 10 seconds gives ample headroom for a slow CI without letting a
+    // 60s-sleep regression slip through.
+    assert!(
+        elapsed < std::time::Duration::from_secs(10),
+        "wrapper took {elapsed:?} to exit after SIGTERM — pgrp forwarding probably broken \
+         (descendant sleep would have run to natural completion at 60s)"
+    );
+
+    // Give the kernel a moment to reap the descendant.
+    std::thread::sleep(std::time::Duration::from_millis(200));
+    let alive = unsafe { libc::kill(descendant_pid as libc::pid_t, 0) } == 0;
+    if alive {
+        // Don't leak the descendant if the fix is wrong.
+        unsafe {
+            libc::kill(descendant_pid as libc::pid_t, libc::SIGKILL);
+        }
+        panic!(
+            "descendant sleep (pid {descendant_pid}) survived after wrapper exit — \
+             SIGINT was not forwarded to the child process group"
+        );
+    }
+}
+
 #[test]
 fn no_command_prints_help_and_exits_nonzero() {
     let (_dir, cfg) = empty_config();

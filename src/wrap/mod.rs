@@ -245,21 +245,74 @@ pub async fn run(opts: WrapOptions) -> Result<ExitStatus> {
     Ok(exit_status)
 }
 
-/// PTY mode: portable-pty's `ExitStatus` differs from `std::process::ExitStatus`.
-/// We round-trip via the inner exit code to produce a `std::process::ExitStatus`
-/// the caller can `.code()` on.
+/// Convert a [`portable_pty::ExitStatus`] into a [`std::process::ExitStatus`]
+/// the caller can `.code()` and (on Unix) `.signal()` on.
+///
+/// portable-pty stores the signal as a *name string* (the output of
+/// `strsignal(3)`) and clamps `exit_code()` to `1` when the child died from
+/// a signal. If we naively round-tripped through `exit_code()`, every
+/// signal-killed child — including the user's Ctrl-C — would surface as
+/// exit code `1`, losing the shell-standard `128 + signum` semantics in
+/// PTY mode. Map the common signal names back to their `libc` constants so
+/// the eventual `propagate_exit_code` call can produce `130` for SIGINT,
+/// `143` for SIGTERM, etc.
 fn portable_status_to_exit_status(s: &portable_pty::ExitStatus) -> ExitStatus {
-    // portable_pty doesn't expose signal info on Unix in a portable way; we
-    // fabricate a std::process::ExitStatus from the exit code.
     #[cfg(unix)]
     {
         use std::os::unix::process::ExitStatusExt;
+        if let Some(name) = s.signal() {
+            if let Some(signum) = signal_name_to_signum(name) {
+                // Encode as signal-killed in the wait status: low 7 bits =
+                // signum, high byte unused. `ExitStatusExt::from_raw` takes
+                // a wait4-style status; this format makes `.signal()`
+                // return Some(signum) and `.code()` return None.
+                return ExitStatus::from_raw(signum & 0x7f);
+            }
+            // Unknown signal name (locale-dependent strsignal output) —
+            // fall back to "code 1" so the shell at least sees a failure
+            // rather than success.
+        }
         ExitStatus::from_raw((s.exit_code() as i32) << 8)
     }
     #[cfg(windows)]
     {
         use std::os::windows::process::ExitStatusExt;
         ExitStatus::from_raw(s.exit_code())
+    }
+}
+
+/// Map portable-pty's `strsignal(3)`-derived signal name back to a libc
+/// signum. Returns `None` for names we don't recognise (e.g. unusual
+/// locale output, or signals we don't bother enumerating).
+///
+/// The names listed cover every signal a *normal* wrapped command will
+/// die from in real shell use: SIGINT (Ctrl-C), SIGTERM (kill default),
+/// SIGHUP (terminal hangup), SIGQUIT (Ctrl-\), SIGKILL (`kill -9`),
+/// SIGABRT (panic / abort), SIGBUS / SIGSEGV / SIGFPE (crashes),
+/// SIGPIPE (broken pipe), SIGALRM (timeout), SIGUSR1/2 (custom). The
+/// mapping accepts both Linux's `strsignal` outputs ("Killed",
+/// "Terminated") and macOS's slightly different forms where they differ.
+#[cfg(unix)]
+fn signal_name_to_signum(name: &str) -> Option<i32> {
+    match name {
+        "Hangup" => Some(libc::SIGHUP),
+        "Interrupt" | "Interrupted" => Some(libc::SIGINT),
+        "Quit" => Some(libc::SIGQUIT),
+        "Illegal instruction" => Some(libc::SIGILL),
+        "Trace/breakpoint trap" | "Trace/BPT trap" => Some(libc::SIGTRAP),
+        "Aborted" | "Abort trap" => Some(libc::SIGABRT),
+        "Bus error" => Some(libc::SIGBUS),
+        "Floating point exception" | "Arithmetic exception" => Some(libc::SIGFPE),
+        "Killed" => Some(libc::SIGKILL),
+        "User defined signal 1" => Some(libc::SIGUSR1),
+        "Segmentation fault" => Some(libc::SIGSEGV),
+        "User defined signal 2" => Some(libc::SIGUSR2),
+        "Broken pipe" => Some(libc::SIGPIPE),
+        "Alarm clock" => Some(libc::SIGALRM),
+        "Terminated" => Some(libc::SIGTERM),
+        // portable_pty's fallback when strsignal returns null:
+        s if s.starts_with("Signal ") => s.strip_prefix("Signal ")?.parse().ok(),
+        _ => None,
     }
 }
 
@@ -303,6 +356,75 @@ async fn async_tee_loop<R, W>(
                 break;
             }
         }
+    }
+}
+
+#[cfg(all(test, unix))]
+mod conversion_tests {
+    use super::*;
+    use std::os::unix::process::ExitStatusExt;
+
+    #[test]
+    fn signal_name_to_signum_maps_common_signals() {
+        assert_eq!(signal_name_to_signum("Interrupt"), Some(libc::SIGINT));
+        assert_eq!(signal_name_to_signum("Interrupted"), Some(libc::SIGINT));
+        assert_eq!(signal_name_to_signum("Terminated"), Some(libc::SIGTERM));
+        assert_eq!(signal_name_to_signum("Killed"), Some(libc::SIGKILL));
+        assert_eq!(signal_name_to_signum("Hangup"), Some(libc::SIGHUP));
+        assert_eq!(signal_name_to_signum("Quit"), Some(libc::SIGQUIT));
+        assert_eq!(signal_name_to_signum("Aborted"), Some(libc::SIGABRT));
+        assert_eq!(signal_name_to_signum("Abort trap"), Some(libc::SIGABRT));
+        assert_eq!(signal_name_to_signum("Bus error"), Some(libc::SIGBUS));
+        assert_eq!(
+            signal_name_to_signum("Segmentation fault"),
+            Some(libc::SIGSEGV)
+        );
+        assert_eq!(signal_name_to_signum("Broken pipe"), Some(libc::SIGPIPE));
+        assert_eq!(signal_name_to_signum("Alarm clock"), Some(libc::SIGALRM));
+        // portable_pty's fallback when strsignal returns null.
+        assert_eq!(signal_name_to_signum("Signal 31"), Some(31));
+        // Unknown name returns None so the caller falls back to exit code.
+        assert_eq!(signal_name_to_signum("blah blah"), None);
+    }
+
+    #[test]
+    fn portable_status_to_exit_status_preserves_signal_for_sigint() {
+        let portable = portable_pty::ExitStatus::with_signal("Interrupt");
+        let status = portable_status_to_exit_status(&portable);
+        assert_eq!(
+            status.signal(),
+            Some(libc::SIGINT),
+            "signal-killed PTY child should round-trip to a signalled std::process::ExitStatus"
+        );
+        assert_eq!(
+            status.code(),
+            None,
+            "signalled status must report code() = None so the caller can apply 128+signum"
+        );
+    }
+
+    #[test]
+    fn portable_status_to_exit_status_preserves_signal_for_sigterm() {
+        let portable = portable_pty::ExitStatus::with_signal("Terminated");
+        let status = portable_status_to_exit_status(&portable);
+        assert_eq!(status.signal(), Some(libc::SIGTERM));
+    }
+
+    #[test]
+    fn portable_status_to_exit_status_passes_through_normal_exit() {
+        let portable = portable_pty::ExitStatus::with_exit_code(7);
+        let status = portable_status_to_exit_status(&portable);
+        assert_eq!(status.signal(), None);
+        assert_eq!(status.code(), Some(7));
+    }
+
+    #[test]
+    fn portable_status_to_exit_status_unknown_signal_falls_back_to_exit_code() {
+        // portable-pty puts code=1 in this case (matches std::process behavior).
+        let portable = portable_pty::ExitStatus::with_signal("XYZZY signal");
+        let status = portable_status_to_exit_status(&portable);
+        // Falls back to "exit code" path: code = 1
+        assert_eq!(status.code(), Some(1));
     }
 }
 

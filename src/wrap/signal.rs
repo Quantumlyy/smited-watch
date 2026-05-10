@@ -90,13 +90,22 @@ pub fn install_handlers(
                 if let Some(pid) = child_pid {
                     debug!(
                         pid,
-                        signum, "smited-watch: signal received, forwarding to child"
+                        signum, "smited-watch: signal received, forwarding to child pgrp"
                     );
+                    // We forward to the negative PID (the child's process
+                    // group). PTY-mode children are session leaders via
+                    // portable-pty's setsid; pipe-mode children are made
+                    // pgrp leaders via `process_group(0)` at spawn time.
+                    // In both cases pgid == pid, so `kill(-pid, signum)`
+                    // signals the child *and* any descendants it spawned
+                    // in the same group — matching what the controlling
+                    // terminal would do for a real Ctrl-C.
+                    //
                     // SAFETY: kill(2) is async-signal-safe and returns -1
                     // on error rather than UB. We ignore the return — if
-                    // the child has already exited, ESRCH is fine.
+                    // the group has already exited, ESRCH is fine.
                     unsafe {
-                        libc::kill(pid as libc::pid_t, signum);
+                        libc::kill(-(pid as libc::pid_t), signum);
                     }
                 }
             }

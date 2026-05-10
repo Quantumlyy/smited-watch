@@ -129,6 +129,13 @@ fn spawn_pipes(cmd: &[OsString]) -> Result<PipeChild> {
         // Inherit stdin so the child reads the parent's stdin directly,
         // unbuffered through the OS, without the watcher in the loop.
         .stdin(Stdio::inherit());
+    // Put the child in its own process group (pgid = child's pid) so the
+    // signal handler can target the entire group with `kill(-pid, signum)`
+    // and reach any descendants the child spawns. Without this, the child
+    // inherits the wrapper's pgrp and `kill(-pid, …)` either no-ops
+    // (ESRCH) or, worse, signals the wrapper itself.
+    #[cfg(unix)]
+    command.process_group(0);
     let mut child = command.spawn().context("spawn child via pipes")?;
     let stdout = child
         .stdout
