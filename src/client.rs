@@ -133,9 +133,21 @@ impl TriggerClient {
                 Some(r) => r,
                 None => break,
             };
+            // Snapshot the abort handle BEFORE moving `h` into `timeout`.
+            // `tokio::time::timeout` consumes the JoinHandle on Err
+            // (Elapsed) and drops it — but dropping a JoinHandle does NOT
+            // cancel the task. Without this explicit `.abort()`, the
+            // first timed-out trigger task would keep running indefinitely
+            // on a long-lived runtime (binary's main exits soon enough
+            // that it doesn't matter there, but library callers reusing
+            // the runtime would leak a stale task per drain).
+            let abort = h.abort_handle();
             match tokio::time::timeout(remaining, h).await {
                 Ok(_) => completed += 1,
-                Err(_) => break,
+                Err(_) => {
+                    abort.abort();
+                    break;
+                }
             }
         }
         let stragglers = total - completed;
@@ -315,6 +327,56 @@ mod tests {
             elapsed >= Duration::from_millis(200) && elapsed < Duration::from_millis(400),
             "drain should return at ~deadline; got {:?}",
             elapsed
+        );
+    }
+
+    /// Drain must explicitly `.abort()` a JoinHandle that hits its
+    /// per-task timeout. The bug fixed here: `tokio::time::timeout`
+    /// consumes the handle on Err, but dropping a JoinHandle without
+    /// `.abort()` leaves the task running on the executor — fine for
+    /// the binary (main exits seconds later), but a slow leak for
+    /// library callers reusing a long-lived runtime.
+    ///
+    /// Sandwich the assertion: prove the task is alive *before* drain
+    /// (so the test can't pass trivially if something else completed
+    /// it) and aborted *after*.
+    #[tokio::test]
+    async fn drain_aborts_timed_out_tasks() {
+        let client = TriggerClient::new(
+            None,
+            ConnectionStrategy::Persistent,
+            Duration::from_millis(500),
+        );
+
+        // Inject a 60-second sleep — won't ever finish on its own
+        // within the test budget.
+        let handle = tokio::spawn(async {
+            tokio::time::sleep(Duration::from_secs(60)).await;
+        });
+        let abort_handle = handle.abort_handle();
+        client.inner.in_flight.lock().unwrap().push(handle);
+
+        // Precondition: task is alive before drain. Without this guard
+        // the postcondition could pass trivially if the synthetic task
+        // had completed for some unrelated reason.
+        assert!(
+            !abort_handle.is_finished(),
+            "synthetic task should not have completed before drain"
+        );
+
+        // Drain with a 50ms budget — well under the task's 60s sleep.
+        client.drain(Duration::from_millis(50)).await;
+
+        // Postcondition: drain aborted the task within a short window.
+        // Polling with a 100ms ceiling rather than asserting immediately
+        // because abort delivery is asynchronous on tokio.
+        let deadline = tokio::time::Instant::now() + Duration::from_millis(100);
+        while !abort_handle.is_finished() && tokio::time::Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert!(
+            abort_handle.is_finished(),
+            "drain failed to abort the timed-out task"
         );
     }
 
