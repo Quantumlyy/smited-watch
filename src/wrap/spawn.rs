@@ -64,11 +64,25 @@ pub struct PipeChild {
 ///
 /// The moment any of the three is non-TTY, we drop to pipe mode where
 /// stdout and stderr stay separate and stdin is inherited as-is.
+///
+/// **Windows:** v0.1 always returns `false` here. PTY mode would route
+/// the child via ConPTY through `portable-pty`, but our stdin forwarder
+/// is a no-op on Windows (see `src/wrap/stdin.rs`) — so a TTY-detected
+/// child would silently lose its keyboard input. Forcing pipe mode
+/// preserves stdin functionality at the cost of TTY detection in the
+/// child; documented in `docs/installation.md`.
 pub fn parent_is_tty() -> bool {
-    use std::io::IsTerminal;
-    std::io::stdin().is_terminal()
-        && std::io::stdout().is_terminal()
-        && std::io::stderr().is_terminal()
+    #[cfg(windows)]
+    {
+        return false;
+    }
+    #[cfg(not(windows))]
+    {
+        use std::io::IsTerminal;
+        std::io::stdin().is_terminal()
+            && std::io::stdout().is_terminal()
+            && std::io::stderr().is_terminal()
+    }
 }
 
 /// Spawn the child command. `cmd[0]` is the program; the rest are args.

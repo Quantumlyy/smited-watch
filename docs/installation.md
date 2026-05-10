@@ -44,11 +44,16 @@ terminal and don't downgrade their output.
 
 ### Windows
 
-Best-effort for v0.1. Output passthrough works via ConPTY through
-`portable-pty`. Stdin forwarding (needed for keystroke-driven
-`vitest --watch` and similar) is not yet wired up; the child still
-receives keystrokes through Windows' usual console handle inheritance,
-but raw-mode forwarding is Unix-only.
+In v0.1 `smited-watch` always uses pipe mode on Windows; ConPTY-based
+PTY support is planned for a later release. Tools that detect a TTY
+for richer output (`vitest --watch`, `cargo watch`, `tsc --watch`,
+anything using progress spinners or ANSI clear-screen sequences) will
+fall back to plain output when wrapped on Windows.
+
+Pattern matching, exit-code propagation, and trigger firing all work
+identically; only the visual experience of the wrapped tool's output
+changes. The child still reads the parent's stdin directly through
+Windows' usual console handle inheritance.
 
 ### CI and non-TTY environments
 
