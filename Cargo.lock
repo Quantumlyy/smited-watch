@@ -1217,6 +1217,7 @@ dependencies = [
  "clap",
  "crossterm",
  "dirs",
+ "libc",
  "portable-pty",
  "prost",
  "prost-types",

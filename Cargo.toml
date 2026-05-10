@@ -37,6 +37,9 @@ dirs = "6"
 crossterm = "0.29"
 bytes = "1.11"
 
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
 [build-dependencies]
 tonic-prost-build = "0.14"
 
@@ -45,3 +48,4 @@ tempfile = "3"
 assert_cmd = "2"
 tokio = { version = "1.52", features = ["full", "test-util"] }
 tokio-stream = { version = "0.1", features = ["net"] }
+libc = "0.2"

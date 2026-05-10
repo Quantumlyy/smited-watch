@@ -103,7 +103,7 @@ async fn run_with_config(cli: Cli) -> anyhow::Result<i32> {
 
     let opts = build_wrap_options(cli, config, host_for_client, default_backend_id);
     let status = smited_watch::wrap::run(opts).await?;
-    Ok(status.code().unwrap_or(1))
+    Ok(propagate_exit_code(status))
 }
 
 /// SMITED_WATCH_DISABLE=1 path: spawn the command, pipe stdio, exit with
@@ -123,7 +123,7 @@ async fn run_passthrough(cli: Cli) -> anyhow::Result<i32> {
         force_pipes: false,
     };
     let status = smited_watch::wrap::run(opts).await?;
-    Ok(status.code().unwrap_or(1))
+    Ok(propagate_exit_code(status))
 }
 
 fn build_wrap_options(
@@ -158,6 +158,29 @@ fn build_wrap_options(
         on_exit: config.on_exit,
         force_pipes: false,
     }
+}
+
+/// Translate a child's [`std::process::ExitStatus`] into an exit code we
+/// can hand to `ExitCode::from(...)`. Mirrors the standard Unix shell
+/// convention so that `cargo build && smited-watch -- ...` and CI
+/// pipelines treat signal-killed children the same way the shell would
+/// have if the user had run the command directly.
+///
+/// * Normal exit → propagate the exit code unchanged
+/// * Signal-killed (Unix) → `128 + signum` (e.g. SIGINT = 130, SIGTERM = 143, SIGKILL = 137)
+/// * Anything else (Windows non-zero with no code, etc.) → 1
+fn propagate_exit_code(status: std::process::ExitStatus) -> i32 {
+    if let Some(code) = status.code() {
+        return code;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::ExitStatusExt;
+        if let Some(sig) = status.signal() {
+            return 128 + sig;
+        }
+    }
+    1
 }
 
 fn banner_line(cmd: &[std::ffi::OsString], dry_run: bool) -> String {

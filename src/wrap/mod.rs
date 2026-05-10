@@ -34,7 +34,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use bytes::Bytes;
-use tokio::sync::{mpsc, Mutex};
+use tokio::sync::mpsc;
 use tracing::{debug, warn};
 
 use crate::client::TriggerClient;
@@ -48,7 +48,7 @@ pub mod spawn;
 pub mod stdin;
 pub mod tee;
 
-use self::signal::{install_handlers, ChildHandle, MasterPtyHandle, ShutdownState};
+use self::signal::{install_handlers, MasterPtyHandle, ShutdownState};
 use self::spawn::{spawn as spawn_child, ChildIo};
 use self::stdin::{spawn_stdin_forwarder, RawModeGuard};
 use self::tee::{spawn_blocking_reader, tee_task, Drops, SinkKind, CHANNEL_CAPACITY};
@@ -110,8 +110,9 @@ pub async fn run(opts: WrapOptions) -> Result<ExitStatus> {
     let mut stdin_thread: Option<std::thread::JoinHandle<()>> = None;
 
     let exit_status: ExitStatus;
+    let signal_aborts: Vec<tokio::task::AbortHandle>;
     match child_io {
-        ChildIo::Pty(pty) => {
+        ChildIo::Pty(mut pty) => {
             // PTY mode: stdin raw-mode + forwarder + single output tee.
             raw_mode_guard = Some(RawModeGuard::enable());
             stdin_thread = Some(spawn_stdin_forwarder(pty.writer));
@@ -125,39 +126,22 @@ pub async fn run(opts: WrapOptions) -> Result<ExitStatus> {
                 scan_drops.clone(),
             )));
 
-            let child_arc = Arc::new(Mutex::new(Some(pty.child)));
+            let child_pid = pty.child.process_id();
             let master_arc: Arc<MasterPtyHandle> = Arc::new(MasterPtyHandle::new(pty.master));
-            let _signal_handles = install_handlers(
-                ChildHandle::Pty(child_arc.clone()),
-                Some(master_arc),
-                shutdown_state.clone(),
-            )?;
+            signal_aborts = install_handlers(child_pid, Some(master_arc), shutdown_state.clone())?;
 
-            // Wait for the child on a blocking thread (portable-pty Child
-            // is sync). We don't take it out of the Mutex permanently —
-            // signal handlers may want to .kill() it concurrently.
-            let child_for_wait = child_arc.clone();
+            // Wait for the child on a blocking thread (portable-pty's
+            // `Child` is sync). The Child handle is owned by this
+            // closure; the signal handler doesn't need it because it
+            // forwards via the saved PID directly.
             let exit = tokio::task::spawn_blocking(move || -> Result<ExitStatus> {
-                // Acquire briefly to take a mutable reference; release
-                // between waits so signal handlers can grab it.
-                loop {
-                    let mut guard = child_for_wait.blocking_lock();
-                    if let Some(c) = guard.as_mut() {
-                        if let Some(status) = c.try_wait()? {
-                            return Ok(portable_status_to_exit_status(&status));
-                        }
-                    } else {
-                        // Already taken; should not happen
-                        anyhow::bail!("child handle gone");
-                    }
-                    drop(guard);
-                    std::thread::sleep(Duration::from_millis(20));
-                }
+                let status = pty.child.wait()?;
+                Ok(portable_status_to_exit_status(&status))
             })
             .await??;
             exit_status = exit;
         }
-        ChildIo::Pipes(pipes) => {
+        ChildIo::Pipes(mut pipes) => {
             // Pipes mode: child stdout & stderr are already tokio AsyncRead
             // — no blocking-reader thread needed; we tee them directly.
             let scan_tx_a = scan_tx.clone();
@@ -173,19 +157,12 @@ pub async fn run(opts: WrapOptions) -> Result<ExitStatus> {
                 async_tee(stderr, SinkKind::Stderr, scan_tx_b, drops_b).await;
             }));
 
-            let child_arc = Arc::new(Mutex::new(Some(pipes.child)));
-            let _signal_handles = install_handlers(
-                ChildHandle::Pipes(child_arc.clone()),
-                None,
-                shutdown_state.clone(),
-            )?;
+            let child_pid = pipes.child.id();
+            signal_aborts = install_handlers(child_pid, None, shutdown_state.clone())?;
 
-            // Wait for child via async tokio::process API.
-            let mut taken = {
-                let mut guard = child_arc.lock().await;
-                guard.take().expect("child already taken")
-            };
-            exit_status = taken.wait().await?;
+            // The child handle stays in this scope; we don't share it
+            // with the signal handler, which forwards via the saved PID.
+            exit_status = pipes.child.wait().await?;
         }
     }
 
@@ -247,6 +224,13 @@ pub async fn run(opts: WrapOptions) -> Result<ExitStatus> {
         shutdown_due_to_signal: shutdown_state.was_signal(),
         now: Instant::now(),
     });
+
+    // Stop the signal handlers so they don't keep listening past the
+    // wrapped command's lifetime. (They'd be cancelled when main drops
+    // the runtime anyway, but releasing them now is cleaner.)
+    for h in signal_aborts {
+        h.abort();
+    }
 
     // Spec: "Wait up to 1s for any in-flight trigger calls to complete.
     // Log warnings for stragglers but exit anyway." `drain` actually

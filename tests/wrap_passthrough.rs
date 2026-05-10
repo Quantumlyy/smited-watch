@@ -120,6 +120,71 @@ fn smited_watch_disable_envvar_makes_it_pure_passthrough() {
     assert_eq!(String::from_utf8_lossy(&out.stdout), "hi\n");
 }
 
+#[cfg(unix)]
+#[test]
+fn sigint_is_forwarded_as_sigint_not_sigkill() {
+    // Send SIGINT to smited-watch and verify the wrapped command exits
+    // with signal=SIGINT (signum 2), proving the wrapper forwarded the
+    // exact signal it received rather than calling kill()/start_kill()
+    // which would send SIGKILL (signum 9).
+    //
+    // We don't try to verify a SIGINT trap ran inside the child — bash
+    // defers traps while waiting on `sleep` in the foreground, which
+    // makes that test brittle. The signum check directly verifies the
+    // bug fix without depending on shell-specific trap timing.
+    use std::os::unix::process::ExitStatusExt;
+
+    let (_dir, cfg) = empty_config();
+    let mut child = binary(&cfg)
+        .arg("--")
+        .arg("sleep")
+        .arg("30")
+        .spawn()
+        .expect("spawn smited-watch");
+    let pid = child.id();
+    // Give the wrapper time to initialize its tokio runtime, spawn the
+    // child sleep, and install signal handlers. Generous because cargo
+    // test runs tests in parallel and the system can be loaded.
+    std::thread::sleep(std::time::Duration::from_millis(1500));
+    // SAFETY: we just spawned `child`; its PID is valid for our lifetime.
+    unsafe {
+        libc::kill(pid as libc::pid_t, libc::SIGINT);
+    }
+    let status = child.wait().expect("wait on smited-watch");
+    // smited-watch propagates child-killed-by-signal as 128 + signum.
+    // SIGINT = 2 ⇒ exit code 130. If we'd sent SIGKILL (signum 9) instead,
+    // we'd see 137. Anything else proves the signal forwarding bug.
+    assert_eq!(
+        status.code(),
+        Some(128 + libc::SIGINT),
+        "smited-watch should propagate child-killed-by-SIGINT as 130 \
+         (128+SIGINT), proving the wrapper sent SIGINT — not SIGKILL — to \
+         the child; got status={status:?} (code={:?}, signal={:?})",
+        status.code(),
+        status.signal()
+    );
+}
+
+#[test]
+fn final_line_without_trailing_newline_still_passes_through() {
+    // `printf` (unlike `echo`) does NOT append a trailing newline, so
+    // this exercises the scanner-flush-after-drain ordering: the trailing
+    // line must still reach the parent's stdout.
+    let (_dir, cfg) = empty_config();
+    let out = binary(&cfg)
+        .arg("--")
+        .arg("printf")
+        .arg("trailing-no-newline")
+        .output()
+        .expect("run smited-watch");
+    assert!(out.status.success());
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "trailing-no-newline",
+        "trailing line without \\n must still pass through byte-perfect"
+    );
+}
+
 #[test]
 fn no_command_prints_help_and_exits_nonzero() {
     let (_dir, cfg) = empty_config();

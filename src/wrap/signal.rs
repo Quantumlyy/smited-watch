@@ -1,13 +1,40 @@
 //! SIGINT / SIGTERM forwarding and SIGWINCH PTY resize handling.
 //!
-//! Spec: when smited-watch receives SIGINT or SIGTERM, forward to the
-//! child immediately, then propagate the same exit semantics. On SIGWINCH
-//! (terminal resized), update the PTY size so child UIs render at the
-//! correct width.
+//! Spec: when smited-watch receives SIGINT or SIGTERM, **forward the same
+//! signal** to the child immediately, then propagate the same exit
+//! semantics. On SIGWINCH (terminal resized), update the PTY size so child
+//! UIs render at the correct width.
 //!
-//! Spec also forbids firing any sensations during signal-driven shutdown —
-//! the orchestrator sets [`ShutdownState::shutdown_due_to_signal`] when a
-//! handler fires, and `exit::handle` checks it before firing.
+//! ## Why we forward the signal rather than `kill()` the child
+//!
+//! `tokio::process::Child::kill()` (and `start_kill`) send SIGKILL on Unix
+//! — that's a non-graceful, uncatchable termination. Build tools like
+//! `vitest --watch`, `cargo watch`, dev servers (`vite`, `next dev`,
+//! `webpack-dev-server`) install their own SIGINT handlers to clean up
+//! file watchers, sockets, child workers, and tempfiles before exiting.
+//! Sending SIGKILL bypasses all of that — the user sees orphaned ports,
+//! zombie subprocesses, and incomplete cleanup.
+//!
+//! Forwarding the *received* signal preserves that contract: when the
+//! user hits Ctrl-C, the wrapped command sees SIGINT exactly as it would
+//! have if the user had run it directly without the wrapper.
+//!
+//! ## Why a saved PID rather than a shared `Child` handle
+//!
+//! Keeping the child in an `Arc<Mutex<…>>` so the signal handler can
+//! reach in and call `kill()` creates two failure modes:
+//!
+//! 1. The waiter takes the child out of the mutex to `await wait()` (we
+//!    can't call `wait()` while holding the mutex, since signal handlers
+//!    would block waiting for it). The signal handler then sees `None`
+//!    and silently does nothing — exactly the bug found in pipe mode
+//!    review.
+//! 2. Even if (1) is solved, both `portable_pty::Child::kill` and
+//!    `tokio::process::Child::start_kill` only send SIGKILL — see above.
+//!
+//! Saving the OS PID at spawn time and using `libc::kill(pid, signum)`
+//! avoids both: no shared state contention, and we send the precise
+//! signal we want.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -32,33 +59,46 @@ impl ShutdownState {
     }
 }
 
-/// What the signal handlers know how to kill / resize.
-pub enum ChildHandle {
-    Pty(Arc<tokio::sync::Mutex<Option<Box<dyn portable_pty::Child + Send + Sync>>>>),
-    Pipes(Arc<tokio::sync::Mutex<Option<tokio::process::Child>>>),
-}
-
-/// Install async signal handlers. They live for the lifetime of the
-/// orchestrator task; cancel via the returned [`tokio::task::AbortHandle`]s
-/// when the child exits to avoid leaving zombie tasks.
+/// Install async signal handlers. Returns the abort handles for the
+/// spawned tasks so the orchestrator can stop them once the child has
+/// exited (otherwise they'd block waiting for a signal that's never
+/// coming, leaking memory across long-running parent processes).
+///
+/// `child_pid` is the OS PID of the wrapped command. If `None`, signal
+/// forwarding is a no-op (we can still record `shutdown_due_to_signal`).
 #[cfg(unix)]
 pub fn install_handlers(
-    child: ChildHandle,
+    child_pid: Option<u32>,
     master: Option<Arc<dyn MasterPtyExt>>,
     state: Arc<ShutdownState>,
 ) -> Result<Vec<tokio::task::AbortHandle>> {
     use tokio::signal::unix::{signal, SignalKind};
     let mut handles = Vec::new();
 
-    for kind in [SignalKind::interrupt(), SignalKind::terminate()] {
+    for (kind, signum) in [
+        (SignalKind::interrupt(), libc::SIGINT),
+        (SignalKind::terminate(), libc::SIGTERM),
+    ] {
         let mut sig = signal(kind)?;
-        let child = clone_handle(&child);
         let state = state.clone();
         let h = tokio::spawn(async move {
-            if sig.recv().await.is_some() {
-                debug!(?kind, "smited-watch: signal received, forwarding to child");
+            // Loop in case the user hits Ctrl-C several times in a row —
+            // forward each one. Most build tools escalate SIGINT → SIGKILL
+            // on second/third Ctrl-C themselves (Node, Cargo, etc.).
+            while sig.recv().await.is_some() {
                 state.signal();
-                kill_child(&child).await;
+                if let Some(pid) = child_pid {
+                    debug!(
+                        pid,
+                        signum, "smited-watch: signal received, forwarding to child"
+                    );
+                    // SAFETY: kill(2) is async-signal-safe and returns -1
+                    // on error rather than UB. We ignore the return — if
+                    // the child has already exited, ESRCH is fine.
+                    unsafe {
+                        libc::kill(pid as libc::pid_t, signum);
+                    }
+                }
             }
         });
         handles.push(h.abort_handle());
@@ -86,47 +126,28 @@ pub fn install_handlers(
     Ok(handles)
 }
 
+/// Windows: best-effort. There's no equivalent of "forward this exact
+/// signal" — we listen for Ctrl-C and call `TerminateProcess` via
+/// `OpenProcess` + `TerminateProcess`. v0.1 punts on this and just sets
+/// the shutdown flag; the child receives Ctrl-C through console group
+/// inheritance.
 #[cfg(windows)]
 pub fn install_handlers(
-    child: ChildHandle,
+    _child_pid: Option<u32>,
     _master: Option<Arc<dyn MasterPtyExt>>,
     state: Arc<ShutdownState>,
 ) -> Result<Vec<tokio::task::AbortHandle>> {
     let mut handles = Vec::new();
-    let child_clone = clone_handle(&child);
-    let state_clone = state.clone();
     let h = tokio::spawn(async move {
-        if tokio::signal::ctrl_c().await.is_ok() {
-            state_clone.signal();
-            kill_child(&child_clone).await;
+        loop {
+            if tokio::signal::ctrl_c().await.is_err() {
+                break;
+            }
+            state.signal();
         }
     });
     handles.push(h.abort_handle());
     Ok(handles)
-}
-
-fn clone_handle(child: &ChildHandle) -> ChildHandle {
-    match child {
-        ChildHandle::Pty(arc) => ChildHandle::Pty(arc.clone()),
-        ChildHandle::Pipes(arc) => ChildHandle::Pipes(arc.clone()),
-    }
-}
-
-async fn kill_child(child: &ChildHandle) {
-    match child {
-        ChildHandle::Pty(arc) => {
-            let mut guard = arc.lock().await;
-            if let Some(c) = guard.as_mut() {
-                let _ = c.kill();
-            }
-        }
-        ChildHandle::Pipes(arc) => {
-            let mut guard = arc.lock().await;
-            if let Some(c) = guard.as_mut() {
-                let _ = c.start_kill();
-            }
-        }
-    }
 }
 
 fn current_size() -> Option<(u16, u16)> {
