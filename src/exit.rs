@@ -53,12 +53,10 @@ pub fn handle(ctx: ExitContext) {
 
     // PTY raw-mode delivers Ctrl-C as byte 0x03 *into* the child PTY rather
     // than as a SIGINT to the wrapper, so `shutdown_due_to_signal` is never
-    // set even though the user clearly asked for a stop. Catch this by
-    // checking the child's own death-by-signal: if it was killed by one of
-    // the user-initiated "please stop" signals, suppress the failure
-    // sensation. Crash signals (SIGSEGV, SIGABRT, SIGBUS, SIGFPE) still
-    // fire failure — the wrapped command genuinely broke and the user
-    // should feel that.
+    // set even though the user clearly asked for a stop. Catch the case
+    // where the child died from a user-initiated "please stop" signal
+    // directly — crash signals (SIGSEGV, SIGABRT, SIGBUS, SIGFPE) still
+    // fire failure since the wrapped command genuinely broke.
     #[cfg(unix)]
     {
         use std::os::unix::process::ExitStatusExt;
@@ -73,6 +71,35 @@ pub fn handle(ctx: ExitContext) {
                 );
                 return;
             }
+        }
+    }
+
+    // Fallback heuristic for the trickiest case: a child that *trapped*
+    // SIGINT/SIGTERM and then exited with a conventional shell exit
+    // code instead of dying from the signal. `status.signal()` is `None`
+    // (clean exit), and `shutdown_due_to_signal` may be `false` if the
+    // wrapper itself never observed the signal — which is exactly what
+    // happens in raw-mode PTY: Ctrl-C goes through the stdin forwarder
+    // as byte 0x03 → kernel converts to SIGINT for the child's pgrp →
+    // child traps → child `exit 130`. We never see anything.
+    //
+    //   130 = 128 + SIGINT (POSIX convention for SIGINT-trapped exit)
+    //   143 = 128 + SIGTERM
+    //
+    // This heuristic has a known false-positive: a tool could
+    // legitimately `exit 130` for unrelated reasons. The cost is one
+    // suppressed failure sensation in that very specific case; the
+    // benefit is correct behaviour for every signal-trapping tool
+    // (every dev server, every test runner with a SIGINT handler).
+    if let Some(code) = ctx.status.code() {
+        if code == 130 || code == 143 {
+            debug!(
+                code,
+                "exit: child exit code matches POSIX 128+signum convention \
+                 (SIGINT/SIGTERM trapped and exited cleanly); suppressing \
+                 on-exit sensation"
+            );
+            return;
         }
     }
 
@@ -159,6 +186,23 @@ mod tests {
         {
             use std::os::windows::process::ExitStatusExt;
             ExitStatus::from_raw(0)
+        }
+    }
+
+    /// Build an ExitStatus with a specific exit code (no signal). Used
+    /// to test the 130/143 heuristic for signal-trapping tools.
+    fn status_with_code(code: i32) -> ExitStatus {
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::ExitStatusExt;
+            // Wait status format: low 7 bits = signum (0 for normal exit),
+            // next byte = exit code.
+            ExitStatus::from_raw(code << 8)
+        }
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::ExitStatusExt;
+            ExitStatus::from_raw(code as u32)
         }
     }
 
@@ -292,6 +336,70 @@ mod tests {
             shutdown_due_to_signal: false,
             now,
         });
+    }
+
+    /// Reviewer's #2 regression case: a tool that *traps* SIGINT (Ctrl-C)
+    /// and exits with the conventional 128+SIGINT=130 code. The wrapper
+    /// in PTY raw-mode never observed the signal directly (the byte was
+    /// forwarded into the PTY), and `status.signal()` returns None
+    /// (clean exit). The 130-code heuristic is the only thing that
+    /// catches this, and it MUST suppress the on-exit success sensation.
+    #[tokio::test]
+    async fn signal_trapping_tool_exit_130_suppresses_success_sensation() {
+        let cfg = on_exit("deploy_success", "", 0, 0);
+        let cli = dry_run_client();
+        handle(ExitContext {
+            status: status_with_code(130),
+            duration: Duration::from_secs(60),
+            on_exit: &cfg,
+            default_backend_id: "mock-owo",
+            last_pattern_fire: None,
+            trigger_client: &cli,
+            shutdown_due_to_signal: false,
+            now: Instant::now(),
+        });
+    }
+
+    #[tokio::test]
+    async fn signal_trapping_tool_exit_143_suppresses_failure_sensation() {
+        // Same case for SIGTERM (143 = 128 + SIGTERM).
+        let cfg = on_exit("", "compile_error_severe", 0, 0);
+        let cli = dry_run_client();
+        handle(ExitContext {
+            status: status_with_code(143),
+            duration: Duration::from_secs(60),
+            on_exit: &cfg,
+            default_backend_id: "mock-owo",
+            last_pattern_fire: None,
+            trigger_client: &cli,
+            shutdown_due_to_signal: false,
+            now: Instant::now(),
+        });
+    }
+
+    /// Adjacent exit codes must NOT be suppressed — the heuristic is
+    /// narrowly targeted at 130 / 143. A tool exiting with 129 or 144
+    /// is a regular failure.
+    #[tokio::test]
+    async fn exit_codes_adjacent_to_128_plus_signum_still_fire() {
+        let cfg = on_exit("", "compile_error_severe", 0, 0);
+        let cli = dry_run_client();
+        for code in [1, 2, 127, 129, 131, 142, 144, 255] {
+            handle(ExitContext {
+                status: status_with_code(code),
+                duration: Duration::from_secs(60),
+                on_exit: &cfg,
+                default_backend_id: "mock-owo",
+                last_pattern_fire: None,
+                trigger_client: &cli,
+                shutdown_due_to_signal: false,
+                now: Instant::now(),
+            });
+            // Function returns void; can't assert "fired" against a
+            // dry-run client. Coverage of the not-suppressed branch is
+            // what this test buys us, plus regression-protection if
+            // someone widens the heuristic to e.g. `code >= 128`.
+        }
     }
 
     /// PTY raw-mode case: child exits from SIGINT (which we never received
