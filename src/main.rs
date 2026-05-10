@@ -90,11 +90,14 @@ async fn run_with_config(cli: Cli) -> anyhow::Result<i32> {
         .clone()
         .unwrap_or_else(|| DEFAULT_BACKEND_ID.to_string());
 
-    if !cli.no_banner {
+    // --quiet suppresses every smited-watch-originated stderr line, including
+    // the banner and the auto-created-config notice. The wrapped command's
+    // own output is unaffected.
+    if !cli.quiet && !cli.no_banner {
         let banner = banner_line(&cli.command, dry_run);
         eprintln!("{banner}");
     }
-    if was_auto_created {
+    if !cli.quiet && was_auto_created {
         eprintln!(
             "[smited-watch] wrote default config template to {} — edit it to add patterns",
             config_path.display()

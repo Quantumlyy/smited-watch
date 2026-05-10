@@ -186,6 +186,32 @@ fn final_line_without_trailing_newline_still_passes_through() {
 }
 
 #[test]
+fn quiet_flag_suppresses_banner_and_auto_create_notice() {
+    // The empty_config helper passes --quiet for noise reasons; build a
+    // raw command without the helper so we can prove --quiet works.
+    let (_dir, cfg) = empty_config();
+    let mut c = Command::cargo_bin("smited-watch").expect("binary built by cargo");
+    let out = c
+        // No --no-banner: --quiet alone should suppress everything we emit.
+        .arg("--quiet")
+        .arg("--config")
+        .arg(&cfg)
+        .arg("--")
+        .arg("echo")
+        .arg("hi")
+        .output()
+        .expect("run smited-watch");
+    assert!(out.status.success());
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "hi\n");
+    assert_eq!(
+        out.stderr.len(),
+        0,
+        "--quiet must suppress banner + auto-create notice + tracing output; got stderr: {:?}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+#[test]
 fn no_command_prints_help_and_exits_nonzero() {
     let (_dir, cfg) = empty_config();
     let out = binary(&cfg).output().expect("run smited-watch");
