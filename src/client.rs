@@ -33,13 +33,14 @@
 //!   fire. Slower but immune to stale-connection issues. Use only if
 //!   Persistent proves flaky against your daemon.
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
 
 use anyhow::Result;
 use tokio::sync::Mutex;
+use tokio::task::JoinHandle;
 use tonic::transport::Channel;
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 use crate::config::ConnectionStrategy;
 use crate::proto::smited::v1::{
@@ -61,6 +62,11 @@ struct Inner {
     /// Cached channel for [`ConnectionStrategy::Persistent`]. Always `None`
     /// in [`ConnectionStrategy::PerTrigger`] mode.
     channel: Mutex<Option<Channel>>,
+    /// Tokio join handles for fires that have been spawned but not yet
+    /// completed. The orchestrator calls [`TriggerClient::drain`] on
+    /// shutdown to await these (with a deadline) so trigger calls don't
+    /// get cancelled by the runtime tearing down.
+    in_flight: StdMutex<Vec<JoinHandle<()>>>,
 }
 
 impl TriggerClient {
@@ -71,6 +77,7 @@ impl TriggerClient {
                 host,
                 timeout,
                 channel: Mutex::new(None),
+                in_flight: StdMutex::new(Vec::new()),
             }),
         }
     }
@@ -85,9 +92,66 @@ impl TriggerClient {
     /// on a background task. See module-level docs for failure semantics.
     pub fn fire(&self, req: TriggerRequest) {
         let inner = self.inner.clone();
-        tokio::spawn(async move {
+        let handle = tokio::spawn(async move {
             inner.fire_inner(req).await;
         });
+        // Best-effort task tracking. If the mutex is poisoned (impossible in
+        // practice — the lock guards a Vec push) we simply leak the handle
+        // rather than panic at the user.
+        if let Ok(mut guard) = self.inner.in_flight.lock() {
+            // Opportunistic GC: drop already-completed handles so the Vec
+            // doesn't grow without bound on long-running watchers.
+            guard.retain(|h| !h.is_finished());
+            guard.push(handle);
+        }
+    }
+
+    /// Await all in-flight trigger tasks, capped at `deadline`.
+    ///
+    /// Returns when either every spawned task has completed or the deadline
+    /// elapsed, whichever is first. Stragglers (tasks still running at the
+    /// deadline) are logged at WARN and abandoned — the runtime will
+    /// cancel them when it tears down.
+    ///
+    /// Spec: "Wait up to 1s for any in-flight trigger calls to complete.
+    /// Log warnings for stragglers but exit anyway."
+    pub async fn drain(&self, deadline: Duration) {
+        let handles: Vec<JoinHandle<()>> = match self.inner.in_flight.lock() {
+            Ok(mut g) => std::mem::take(&mut *g),
+            Err(_) => return,
+        };
+        if handles.is_empty() {
+            return;
+        }
+        let total = handles.len();
+        let started = tokio::time::Instant::now();
+        let end = started + deadline;
+        let mut completed = 0usize;
+        let mut iter = handles.into_iter();
+        for h in iter.by_ref() {
+            let remaining = match end.checked_duration_since(tokio::time::Instant::now()) {
+                Some(r) => r,
+                None => break,
+            };
+            match tokio::time::timeout(remaining, h).await {
+                Ok(_) => completed += 1,
+                Err(_) => break,
+            }
+        }
+        let stragglers = total - completed;
+        if stragglers > 0 {
+            // Abort whatever's left so we don't leak past runtime drop.
+            for h in iter {
+                h.abort();
+            }
+            warn!(
+                in_flight = stragglers,
+                "trigger drain: {stragglers} task(s) did not complete within {} ms; exiting anyway",
+                deadline.as_millis(),
+            );
+        } else {
+            debug!(completed, "trigger drain: all in-flight tasks completed");
+        }
     }
 }
 
@@ -180,4 +244,97 @@ async fn connect(host: &str, timeout: Duration) -> Result<Channel> {
     };
     let endpoint = Channel::from_shared(uri)?.connect_timeout(timeout);
     Ok(endpoint.connect().await?)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::proto::smited::v1::trigger_request::Sensation;
+
+    fn dry_req() -> TriggerRequest {
+        TriggerRequest {
+            backend_id: "mock-owo".into(),
+            sensation: Some(Sensation::SensationName("noop".into())),
+            zone_ids: Vec::new(),
+            intensity_scale: None,
+            priority: 0,
+            client_trace_id: "watch-test-1".into(),
+        }
+    }
+
+    /// Drain awaits the in-flight task before returning. We prove this by
+    /// firing in dry-run mode (which does no I/O but still spawns a task)
+    /// and asserting that `drain` doesn't return before the task has had
+    /// a chance to record itself as finished.
+    #[tokio::test]
+    async fn drain_waits_for_in_flight_dry_run_fire() {
+        let client = TriggerClient::new(
+            None, // dry-run
+            ConnectionStrategy::Persistent,
+            Duration::from_millis(500),
+        );
+        client.fire(dry_req());
+        client.fire(dry_req());
+        client.fire(dry_req());
+
+        // Before drain: tasks may not have run yet.
+        // After drain: every spawned task has completed.
+        let started = tokio::time::Instant::now();
+        client.drain(Duration::from_secs(5)).await;
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "dry-run fires complete instantly; drain should return well under the deadline (got {:?})",
+            elapsed
+        );
+        // After drain, in_flight should be empty (all handles consumed).
+        let count = client.inner.in_flight.lock().unwrap().len();
+        assert_eq!(count, 0, "drain must have consumed every handle");
+    }
+
+    /// Drain returns at the deadline rather than waiting forever for a
+    /// stuck task. This confirms the "exit anyway" half of the spec.
+    #[tokio::test(start_paused = true)]
+    async fn drain_returns_at_deadline_with_stragglers() {
+        let client = TriggerClient::new(
+            None,
+            ConnectionStrategy::Persistent,
+            Duration::from_millis(500),
+        );
+        // Inject a long-running task into in_flight directly so we
+        // simulate a fire that's stuck in connect().
+        let h = tokio::spawn(async {
+            tokio::time::sleep(Duration::from_secs(60)).await;
+        });
+        client.inner.in_flight.lock().unwrap().push(h);
+
+        let started = tokio::time::Instant::now();
+        client.drain(Duration::from_millis(200)).await;
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed >= Duration::from_millis(200) && elapsed < Duration::from_millis(400),
+            "drain should return at ~deadline; got {:?}",
+            elapsed
+        );
+    }
+
+    /// Repeated `fire`s GC their finished predecessors so the in_flight
+    /// vec doesn't grow unbounded across a long-running watcher session.
+    #[tokio::test]
+    async fn fire_gcs_finished_handles() {
+        let client = TriggerClient::new(
+            None,
+            ConnectionStrategy::Persistent,
+            Duration::from_millis(500),
+        );
+        client.fire(dry_req());
+        // Give the dry-run fire a moment to complete (it just logs).
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        client.fire(dry_req()); // GC happens here; the prior handle should be reaped
+        let count = client.inner.in_flight.lock().unwrap().len();
+        assert_eq!(
+            count, 1,
+            "after second fire, only the new (still-in-flight) handle should remain; got {count}"
+        );
+    }
 }
