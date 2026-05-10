@@ -183,6 +183,56 @@ fn stdout_and_stderr_chunks_do_not_splice_into_one_logical_line() {
     );
 }
 
+/// PR review #3 (Copilot): the MAX_LINE force-flush must drain
+/// `MAX_LINE` bytes per iteration, not the entire buffer. If a single
+/// `feed` call delivers `>= 2 * MAX_LINE` bytes with no newline, a
+/// `split_to(buf.len())` would scan-and-allocate the whole thing in
+/// one go, defeating the per-line cap.
+///
+/// We can observe the per-iteration bound by placing two matches:
+/// one straddling the MAX_LINE boundary (which the bounded drain will
+/// split and fail to match), and one fully contained in the second
+/// MAX_LINE region (which still matches). The pre-fix behaviour would
+/// have produced 2 events from a single feed; the post-fix behaviour
+/// produces exactly 1.
+#[test]
+fn force_flush_drains_in_max_line_chunks_so_buffer_is_truly_bounded() {
+    let s = make_scanner(vec![pat("ts", r"error TS\d+")]);
+
+    // Build a chunk of exactly 2 * MAX_LINE bytes:
+    //
+    //   bytes 0 .. MAX_LINE-8           dots (filler)
+    //   bytes MAX_LINE-8 .. MAX_LINE    "error TS"   ← straddling match starts here
+    //   bytes MAX_LINE .. MAX_LINE+4    "1234"       ← straddling match's digits
+    //   bytes MAX_LINE+4 .. MAX_LINE+16 "error TS5678"  ← contained match (kept
+    //                                                     near the start of the
+    //                                                     second chunk so the
+    //                                                     excerpt includes it)
+    //   bytes MAX_LINE+16 .. 2*MAX_LINE dots (trailing filler)
+    let mut chunk = Vec::with_capacity(2 * MAX_LINE);
+    chunk.extend(std::iter::repeat_n(b'.', MAX_LINE - 8));
+    chunk.extend_from_slice(b"error TS");
+    chunk.extend_from_slice(b"1234");
+    chunk.extend_from_slice(b"error TS5678");
+    chunk.extend(std::iter::repeat_n(b'.', MAX_LINE - 16));
+    assert_eq!(
+        chunk.len(),
+        2 * MAX_LINE,
+        "test setup: chunk should be exactly 2 * MAX_LINE"
+    );
+
+    let events = s.feed(StreamId::Stdout, &chunk);
+    assert_eq!(
+        events.len(),
+        1,
+        "expected exactly 1 match — the contained 'error TS5678' fires; \
+         the straddling 'error TS1234' is split at the MAX_LINE boundary \
+         by the bounded force-flush. Pre-fix would have scanned both \
+         matches in one buffer-spanning scan_line call. got {events:?}"
+    );
+    assert!(events[0].line_excerpt.contains("5678"));
+}
+
 /// The default test_failure pattern (in examples/wrap.toml + the
 /// patterns-cookbook entry) must NOT match a clean test summary like
 /// "0 failed, 12 passed", which is what every major runner prints on

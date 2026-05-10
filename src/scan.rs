@@ -19,10 +19,19 @@
 //! A pathological input — `tail -f` on a log with no newlines, a hung
 //! progress indicator that emits megabytes between newlines — would grow
 //! the buffer without bound. We cap each line at [`MAX_LINE`]; on overflow
-//! we force-flush the buffered prefix as if a newline had arrived, log a
-//! debug-level warning, and start a fresh buffer. The match may be against
-//! a truncated line, but that's better than OOM and far better than
-//! silently dropping the line.
+//! we force-flush exactly [`MAX_LINE`] bytes (not the entire buffer) and
+//! continue the loop. A single oversized `feed` call with a chunk many
+//! multiples of [`MAX_LINE`] is therefore drained in [`MAX_LINE`]-sized
+//! pieces, each scanned independently — the per-scan-call buffer is
+//! truly bounded, even if the *caller* hands us a giant slice.
+//!
+//! Documented limitation: a regex match that *straddles* a [`MAX_LINE`]
+//! boundary in a no-newline run will be split and won't fire, because
+//! neither half of the cut contains the full match. The alternative
+//! (`split_to(buf.len())` for the whole oversized buffer) defeats the
+//! cap and would let a single call scan-and-allocate hundreds of MB on
+//! a pathological input. Better to occasionally miss a match in a 64+
+//! KiB no-newline run than to OOM.
 //!
 //! ## Why `\r` is not a line terminator
 //!
@@ -139,10 +148,17 @@ impl Scanner {
                 self.scan_line(stream, content, &mut events);
                 continue;
             }
-            // No newline in the buffer. Force-flush if oversized.
-            let len = buf.len();
-            if len >= MAX_LINE {
-                let drained = buf.split_to(len);
+            // No newline in the buffer. Force-flush if oversized — but
+            // drain only `MAX_LINE` bytes per iteration, not the entire
+            // buffer. If a single `feed` call delivered a chunk many
+            // multiples of `MAX_LINE` (e.g. a unit-test passing a 10 MB
+            // slice), `split_to(buf.len())` would scan-and-allocate the
+            // whole thing in one go, defeating the per-line cap. The
+            // loop continues, so successive iterations drain the rest
+            // in MAX_LINE-sized chunks until the buffer is below the
+            // threshold or hits a newline.
+            if buf.len() >= MAX_LINE {
+                let drained = buf.split_to(MAX_LINE);
                 debug!(
                     line_len = drained.len(),
                     ?stream,
