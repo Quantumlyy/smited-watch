@@ -122,16 +122,35 @@ pub async fn tee_task(
     scan_tx: mpsc::Sender<(StreamId, Bytes)>,
     drops: Drops,
     pipe_broken: Arc<Notify>,
+    progress: Drops,
 ) {
     // tokio::io::Stdout and Stderr have different concrete types — we
     // monomorphise on each side rather than try to dyn-trait them, since
     // `AsyncWriteExt` isn't object-safe.
     match sink {
         SinkKind::Stdout => {
-            tee_loop(rx, tokio::io::stdout(), sink, scan_tx, drops, pipe_broken).await
+            tee_loop(
+                rx,
+                tokio::io::stdout(),
+                sink,
+                scan_tx,
+                drops,
+                pipe_broken,
+                progress,
+            )
+            .await
         }
         SinkKind::Stderr => {
-            tee_loop(rx, tokio::io::stderr(), sink, scan_tx, drops, pipe_broken).await
+            tee_loop(
+                rx,
+                tokio::io::stderr(),
+                sink,
+                scan_tx,
+                drops,
+                pipe_broken,
+                progress,
+            )
+            .await
         }
     }
 }
@@ -143,6 +162,7 @@ async fn tee_loop<W>(
     scan_tx: mpsc::Sender<(StreamId, Bytes)>,
     drops: Drops,
     pipe_broken: Arc<Notify>,
+    progress: Drops,
 ) where
     W: AsyncWriteExt + Unpin,
 {
@@ -175,6 +195,7 @@ async fn tee_loop<W>(
             }
             debug!(error = %e, ?sink, "tee: parent flush failed");
         }
+        progress.fetch_add(1, Ordering::Relaxed);
         // Then fan out to scanner. Drop on full — passthrough latency wins.
         if scan_tx.try_send((stream_id, chunk)).is_err() {
             drops.fetch_add(1, Ordering::Relaxed);

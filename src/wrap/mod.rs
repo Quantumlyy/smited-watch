@@ -28,7 +28,7 @@
 
 use std::ffi::OsString;
 use std::process::ExitStatus;
-use std::sync::atomic::AtomicU64;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::{Duration, Instant};
 
@@ -83,6 +83,8 @@ pub async fn run(opts: WrapOptions) -> Result<ExitStatus> {
     let scanner = Arc::new(Scanner::new(opts.patterns.clone())?);
     let last_pattern_fire: Arc<StdMutex<Option<Instant>>> = Arc::new(StdMutex::new(None));
     let scan_drops: Drops = Arc::new(AtomicU64::new(0));
+    let tee_progress: Drops = Arc::new(AtomicU64::new(0));
+    let scan_progress: Drops = Arc::new(AtomicU64::new(0));
     let shutdown_state = Arc::new(ShutdownState::default());
     // Notified by tee tasks when their parent-stdout/stderr write fails
     // with `BrokenPipe` — i.e. the downstream pipeline consumer
@@ -108,6 +110,7 @@ pub async fn run(opts: WrapOptions) -> Result<ExitStatus> {
         opts.trigger_client.clone(),
         opts.default_backend_id.clone(),
         last_pattern_fire.clone(),
+        scan_progress.clone(),
     ));
 
     // ──────────────────────────────────────────────────────────────────
@@ -134,6 +137,7 @@ pub async fn run(opts: WrapOptions) -> Result<ExitStatus> {
                 scan_tx.clone(),
                 scan_drops.clone(),
                 pipe_broken.clone(),
+                tee_progress.clone(),
             )));
 
             // PTY-mode children are session leaders via portable-pty's
@@ -162,15 +166,33 @@ pub async fn run(opts: WrapOptions) -> Result<ExitStatus> {
             let drops_a = scan_drops.clone();
             let stdout = pipes.stdout;
             let pb_a = pipe_broken.clone();
+            let progress_a = tee_progress.clone();
             tee_tasks.push(tokio::spawn(async move {
-                async_tee(stdout, SinkKind::Stdout, scan_tx_a, drops_a, pb_a).await;
+                async_tee(
+                    stdout,
+                    SinkKind::Stdout,
+                    scan_tx_a,
+                    drops_a,
+                    pb_a,
+                    progress_a,
+                )
+                .await;
             }));
             let scan_tx_b = scan_tx.clone();
             let drops_b = scan_drops.clone();
             let stderr = pipes.stderr;
             let pb_b = pipe_broken.clone();
+            let progress_b = tee_progress.clone();
             tee_tasks.push(tokio::spawn(async move {
-                async_tee(stderr, SinkKind::Stderr, scan_tx_b, drops_b, pb_b).await;
+                async_tee(
+                    stderr,
+                    SinkKind::Stderr,
+                    scan_tx_b,
+                    drops_b,
+                    pb_b,
+                    progress_b,
+                )
+                .await;
             }));
 
             // Pipe-mode children are pgrp leaders only when stdin was
@@ -200,33 +222,9 @@ pub async fn run(opts: WrapOptions) -> Result<ExitStatus> {
     // write end open are exactly the case we want to abort, not wait
     // longer for: `bash -c 'sleep 60 & exit 0'` should exit promptly
     // with bash's exit code, not hang for 60 seconds waiting for sleep.
-    let grace = Duration::from_millis(100);
+    let idle_grace = Duration::from_millis(250);
 
-    // Snapshot abort handles for every tee task BEFORE moving the
-    // JoinHandles into the join_all future. tokio::time::timeout
-    // consumes the JoinHandle on Err(Elapsed) and drops it — and
-    // dropping a JoinHandle does NOT cancel the underlying task. The
-    // tee task would then keep running on the executor, still holding
-    // its scan_tx clone (which keeps the scanner channel alive) and
-    // its read end (which keeps reading from the child's pipe).
-    // Capturing abort handles up front lets us actually cancel them.
-    let tee_aborts: Vec<tokio::task::AbortHandle> =
-        tee_tasks.iter().map(|t| t.abort_handle()).collect();
-    let join_all = async {
-        for t in tee_tasks {
-            let _ = t.await;
-        }
-    };
-    if tokio::time::timeout(grace, join_all).await.is_err() {
-        for abort in &tee_aborts {
-            abort.abort();
-        }
-        debug!(
-            grace_ms = grace.as_millis() as u64,
-            "wrap: tee tasks didn't drain within grace window — likely a \
-             backgrounded descendant holding stdout/stderr open; aborted"
-        );
-    }
+    wait_for_tasks_with_idle_timeout("tee", tee_tasks, tee_progress, idle_grace).await;
     // Reap blocking reader threads. In normal exit they've already
     // returned (EOF). When a backgrounded descendant kept the pipe
     // open, the reader thread is still blocked on its next `read()`;
@@ -237,20 +235,7 @@ pub async fn run(opts: WrapOptions) -> Result<ExitStatus> {
     // We don't join it — the process will exit shortly.
     drop(stdin_thread);
 
-    // Same JoinHandle-drop bug applies to the scanner consumer: if its
-    // grace timeout elapses (for example because a tee task was aborted
-    // above and didn't drop its scan_tx clone before the abort took
-    // effect), `tokio::time::timeout(_, scan_consumer)` would drop the
-    // handle without cancelling the task. Snapshot the abort handle
-    // first.
-    let scan_abort = scan_consumer.abort_handle();
-    if tokio::time::timeout(grace, scan_consumer).await.is_err() {
-        scan_abort.abort();
-        debug!(
-            grace_ms = grace.as_millis() as u64,
-            "wrap: scan consumer didn't drain within grace window; aborted"
-        );
-    }
+    wait_for_tasks_with_idle_timeout("scan", vec![scan_consumer], scan_progress, idle_grace).await;
 
     // Now flush trailing partial lines for every stream and dispatch.
     let final_events = scanner.flush_all();
@@ -265,7 +250,7 @@ pub async fn run(opts: WrapOptions) -> Result<ExitStatus> {
         );
     }
 
-    let drops = scan_drops.load(std::sync::atomic::Ordering::Relaxed);
+    let drops = scan_drops.load(Ordering::Relaxed);
     if drops > 0 {
         debug!(dropped_chunks = drops, "scanner dropped chunks during run");
     }
@@ -302,6 +287,52 @@ pub async fn run(opts: WrapOptions) -> Result<ExitStatus> {
     drop(raw_mode_guard);
 
     Ok(exit_status)
+}
+
+/// Await a group of tasks until every task exits, aborting only after the
+/// group has made no observable progress for `idle_timeout`.
+///
+/// A fixed post-child-exit timeout truncates legitimate final output when
+/// the child emitted more bytes than the parent terminal can flush in that
+/// short window. An idle timeout preserves the background-descendant escape
+/// hatch while continuing to drain as long as bytes are still moving.
+async fn wait_for_tasks_with_idle_timeout(
+    task_group: &'static str,
+    tasks: Vec<tokio::task::JoinHandle<()>>,
+    progress: Drops,
+    idle_timeout: Duration,
+) -> bool {
+    let aborts: Vec<tokio::task::AbortHandle> = tasks.iter().map(|t| t.abort_handle()).collect();
+    let join_all = async move {
+        for task in tasks {
+            let _ = task.await;
+        }
+    };
+    tokio::pin!(join_all);
+
+    let mut last_progress = progress.load(Ordering::Relaxed);
+    loop {
+        let idle = tokio::time::sleep(idle_timeout);
+        tokio::pin!(idle);
+        tokio::select! {
+            _ = &mut join_all => return true,
+            _ = &mut idle => {
+                let current = progress.load(Ordering::Relaxed);
+                if current == last_progress {
+                    for abort in &aborts {
+                        abort.abort();
+                    }
+                    debug!(
+                        task_group,
+                        idle_ms = idle_timeout.as_millis() as u64,
+                        "wrap: task group made no progress within idle window; aborted"
+                    );
+                    return false;
+                }
+                last_progress = current;
+            }
+        }
+    }
 }
 
 /// Watch for the "downstream pipeline consumer closed our output" signal
@@ -414,15 +445,34 @@ async fn async_tee<R>(
     scan_tx: mpsc::Sender<(StreamId, Bytes)>,
     drops: Drops,
     pipe_broken: Arc<Notify>,
+    progress: Drops,
 ) where
     R: tokio::io::AsyncRead + Unpin + Send,
 {
     match sink {
         SinkKind::Stdout => {
-            async_tee_loop(src, tokio::io::stdout(), sink, scan_tx, drops, pipe_broken).await
+            async_tee_loop(
+                src,
+                tokio::io::stdout(),
+                sink,
+                scan_tx,
+                drops,
+                pipe_broken,
+                progress,
+            )
+            .await
         }
         SinkKind::Stderr => {
-            async_tee_loop(src, tokio::io::stderr(), sink, scan_tx, drops, pipe_broken).await
+            async_tee_loop(
+                src,
+                tokio::io::stderr(),
+                sink,
+                scan_tx,
+                drops,
+                pipe_broken,
+                progress,
+            )
+            .await
         }
     }
 }
@@ -434,6 +484,7 @@ async fn async_tee_loop<R, W>(
     scan_tx: mpsc::Sender<(StreamId, Bytes)>,
     drops: Drops,
     pipe_broken: Arc<Notify>,
+    progress: Drops,
 ) where
     R: tokio::io::AsyncRead + Unpin + Send,
     W: tokio::io::AsyncWriteExt + Unpin,
@@ -453,6 +504,7 @@ async fn async_tee_loop<R, W>(
                             return;
                         }
                     }
+                    progress.fetch_add(1, Ordering::Relaxed);
                     if scan_tx
                         .try_send((stream_id, Bytes::copy_from_slice(&buf[..n])))
                         .is_err()
@@ -545,6 +597,61 @@ mod conversion_tests {
         // Falls back to "exit code" path: code = 1
         assert_eq!(status.code(), Some(1));
     }
+
+    #[tokio::test]
+    async fn idle_timeout_keeps_waiting_while_tasks_make_progress() {
+        let progress: Drops = Arc::new(AtomicU64::new(0));
+        let task_progress = progress.clone();
+        let task = tokio::spawn(async move {
+            for _ in 0..5 {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+                task_progress.fetch_add(1, Ordering::Relaxed);
+            }
+        });
+
+        let drained = wait_for_tasks_with_idle_timeout(
+            "test",
+            vec![task],
+            progress,
+            Duration::from_millis(50),
+        )
+        .await;
+
+        assert!(
+            drained,
+            "task should be allowed to run longer than one idle window while it is still progressing"
+        );
+    }
+
+    #[tokio::test]
+    async fn idle_timeout_aborts_when_tasks_stop_progressing() {
+        let progress: Drops = Arc::new(AtomicU64::new(0));
+        let task = tokio::spawn(async {
+            tokio::time::sleep(Duration::from_secs(60)).await;
+        });
+        let abort = task.abort_handle();
+
+        let drained = wait_for_tasks_with_idle_timeout(
+            "test",
+            vec![task],
+            progress,
+            Duration::from_millis(20),
+        )
+        .await;
+
+        assert!(
+            !drained,
+            "idle task should be aborted after the idle window"
+        );
+        let deadline = tokio::time::Instant::now() + Duration::from_millis(100);
+        while !abort.is_finished() && tokio::time::Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert!(
+            abort.is_finished(),
+            "idle timeout should abort the still-running task"
+        );
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -556,9 +663,11 @@ async fn scan_consumer_task(
     trigger_client: Arc<TriggerClient>,
     default_backend_id: String,
     last_pattern_fire: Arc<StdMutex<Option<Instant>>>,
+    progress: Drops,
 ) {
     while let Some((stream, chunk)) = rx.recv().await {
         let events = scanner.feed(stream, &chunk);
+        progress.fetch_add(1, Ordering::Relaxed);
         if events.is_empty() {
             continue;
         }
