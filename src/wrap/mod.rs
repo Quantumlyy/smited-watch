@@ -245,9 +245,9 @@ pub async fn run(opts: WrapOptions) -> Result<ExitStatus> {
 
     // Spec: wait up to 1s for in-flight trigger calls to complete. We
     // don't track them individually — a fixed sleep is the simplest
-    // correct implementation and matches the spec text.
-    let drain = tokio::time::timeout(Duration::from_secs(1), async {}).await;
-    let _ = drain;
+    // correct implementation and matches the spec text. Most fires
+    // complete in tens of ms; the 1s ceiling caps worst-case wait.
+    tokio::time::sleep(Duration::from_secs(1)).await;
 
     // Restore terminal cooked mode before returning.
     drop(raw_mode_guard);

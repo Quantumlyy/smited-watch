@@ -16,8 +16,7 @@ pub const DEFAULT_BACKEND_ID: &str = "mock-owo";
 #[command(
     name = "smited-watch",
     version,
-    about = "Wrap a command and fire haptic sensations on the smited daemon when its output matches configured patterns.",
-    trailing_var_arg = true
+    about = "Wrap a command and fire haptic sensations on the smited daemon when its output matches configured patterns."
 )]
 pub struct Cli {
     /// Path to config file (defaults to platform-specific user dir).

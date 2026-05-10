@@ -44,3 +44,4 @@ tonic-prost-build = "0.14"
 tempfile = "3"
 assert_cmd = "2"
 tokio = { version = "1.52", features = ["full", "test-util"] }
+tokio-stream = { version = "0.1", features = ["net"] }
