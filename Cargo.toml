@@ -7,7 +7,7 @@ authors = ["Nejc Drobnič <nejc@nejc.dev>"]
 description = "Wraps a command and fires haptic sensations on the smited daemon when its output matches configured patterns."
 repository = "https://github.com/Quantumlyy/smited-watch"
 readme = "README.md"
-rust-version = "1.75"
+rust-version = "1.88"
 
 [[bin]]
 name = "smited-watch"
