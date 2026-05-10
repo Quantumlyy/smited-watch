@@ -1,5 +1,23 @@
 //! End-to-end passthrough tests: run the built `smited-watch` binary and
 //! verify stdio is forwarded byte-perfect and the exit code propagates.
+//!
+//! ## Why `#![cfg(unix)]` at the crate root
+//!
+//! Every test in this file shells out via `bash -c …` and reads from
+//! Unix-only paths (`/dev/zero`, `/dev/tty`) and binaries (`echo`,
+//! `printf`, `head -c`, `sleep`). The CI matrix includes
+//! `windows-latest` where none of those exist, so without this gate
+//! the whole `cargo test` invocation would fail to compile / link /
+//! find binaries. Gating at the crate level makes the file an empty
+//! integration-test crate on Windows; per-test `#[cfg(unix)]`
+//! annotations are now redundant but kept for local readability.
+//!
+//! Future work: a small cross-platform test-helper binary
+//! (deterministic stdout/stderr, configurable exit code, configurable
+//! stdin echo) would let us run a subset of these tests on Windows
+//! too. Out of scope for v0.1.
+
+#![cfg(unix)]
 
 use std::process::Command;
 

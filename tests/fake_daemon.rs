@@ -4,6 +4,23 @@
 //! runs the built smited-watch binary against it with a config that
 //! matches `error TS\d+`, and asserts the daemon received exactly the
 //! expected `TriggerRequest`s.
+//!
+//! ## Why `#![cfg(unix)]` at the crate root
+//!
+//! `run_binary_with` shells out via `bash -c <script>` so every
+//! integration test in this file is Unix-only. The CI matrix includes
+//! `windows-latest` where `bash` is typically unavailable, so gating
+//! at the crate level makes the file an empty integration-test crate
+//! on Windows rather than failing to find the binary at runtime. The
+//! per-test `#[cfg(unix)]` annotations elsewhere in the file are now
+//! redundant but kept for local readability.
+//!
+//! Future work: a small cross-platform test-helper binary that prints
+//! a configurable line to stdout and exits with a configurable code
+//! would let us run a subset of these tests on Windows. Out of scope
+//! for v0.1.
+
+#![cfg(unix)]
 
 use std::process::{Command, Stdio};
 use std::sync::Arc;
