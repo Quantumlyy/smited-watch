@@ -193,14 +193,38 @@ pub async fn run(opts: WrapOptions) -> Result<ExitStatus> {
     // tasks have finished forwarding their final bytes.
     drop(scan_tx);
 
-    // Wait for tee tasks (they exit when their reader-mpsc closes).
-    for t in tee_tasks {
-        let _ = t.await;
+    // Bound the post-exit drain. The grace window is NOT for letting the
+    // kernel flush its pipe buffer (that takes microseconds once the
+    // writer closes); it's for catching any final bytes the child itself
+    // buffered before exiting. Backgrounded descendants holding the
+    // write end open are exactly the case we want to abort, not wait
+    // longer for: `bash -c 'sleep 60 & exit 0'` should exit promptly
+    // with bash's exit code, not hang for 60 seconds waiting for sleep.
+    let grace = Duration::from_millis(100);
+    let join_all = async {
+        for t in tee_tasks {
+            let _ = t.await;
+        }
+    };
+    if tokio::time::timeout(grace, join_all).await.is_err() {
+        debug!(
+            grace_ms = grace.as_millis() as u64,
+            "wrap: tee tasks didn't drain within grace window — likely a \
+             backgrounded descendant holding stdout/stderr open; aborting"
+        );
+        // Tee tasks are still alive (blocked on reader recv). The
+        // reader handles they hold are dropped at await-point return,
+        // which closes our read end of the child's pipes — descendants
+        // get EPIPE on their next write. Signal-handler forwarding
+        // doesn't apply here (the immediate child has already exited
+        // with its own status, which we'll propagate as recorded).
     }
-    // Reap blocking reader threads (they exit on EOF or send-fail).
-    for t in reader_threads {
-        let _ = t.join();
-    }
+    // Reap blocking reader threads. In normal exit they've already
+    // returned (EOF). When a backgrounded descendant kept the pipe
+    // open, the reader thread is still blocked on its next `read()`;
+    // it'll terminate when the OS reaps the process at std::process::exit.
+    // We don't join it here because join() would block forever.
+    let _ = reader_threads;
     // Stdin thread will keep going until parent stdin EOFs or write fails.
     // We don't join it — the process will exit shortly.
     drop(stdin_thread);
@@ -210,8 +234,10 @@ pub async fn run(opts: WrapOptions) -> Result<ExitStatus> {
     // guaranteed to contain all bytes produced by the child — calling
     // `scanner.flush()` earlier would emit a stale partial line and we'd
     // never see the trailing one for commands that print a final line
-    // without a `\n`.
-    let _ = scan_consumer.await;
+    // without a `\n`. Bound this with the same grace logic: if a tee
+    // task was aborted above, scan_tx clones it held are dropped, the
+    // channel closes, and the consumer terminates immediately.
+    let _ = tokio::time::timeout(grace, scan_consumer).await;
 
     // Now flush trailing partial lines for every stream and dispatch.
     let final_events = scanner.flush_all();

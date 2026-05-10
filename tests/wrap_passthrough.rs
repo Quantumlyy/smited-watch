@@ -396,6 +396,48 @@ fn pipeline_close_makes_wrapper_exit_promptly() {
 }
 
 #[test]
+fn backgrounded_descendant_does_not_keep_wrapper_alive() {
+    // The reviewer's #1 scenario: `bash -c 'sleep 60 & exit 0'`. The
+    // immediate child (bash) exits immediately, but it backgrounded a
+    // sleep that inherited bash's stdout/stderr pipes. Pre-fix the
+    // wrapper would block on its tee tasks (still reading from the
+    // descendant) until sleep finished naturally. Post-fix the wrapper
+    // gives tee tasks a 100ms grace window then aborts, returning with
+    // bash's exit code (0).
+    let (_dir, cfg) = empty_config();
+    let started = std::time::Instant::now();
+    let out = binary(&cfg)
+        .arg("--")
+        .arg("bash")
+        .arg("-c")
+        .arg("sleep 60 & exit 0")
+        .output()
+        .expect("run smited-watch");
+    let elapsed = started.elapsed();
+
+    // Bash returns 0 immediately. A direct shell run completes in tens
+    // of ms; allow generous CI headroom but reject the 60-second hang.
+    assert!(
+        elapsed < std::time::Duration::from_secs(2),
+        "wrapper took {elapsed:?} after bash exited — backgrounded sleep \
+         (descendant holding pipes open) wasn't aborted; status={:?}",
+        out.status
+    );
+    assert!(
+        out.status.success(),
+        "wrapper should propagate bash's exit code 0; got {:?}",
+        out.status
+    );
+
+    // Belt-and-braces: don't leave the descendant sleep running for the
+    // next minute. We don't have its PID but `pkill -f` is reasonable
+    // for a self-contained test cleanup. Best-effort, don't assert.
+    let _ = std::process::Command::new("pkill")
+        .args(["-f", "sleep 60"])
+        .status();
+}
+
+#[test]
 fn no_command_prints_help_and_exits_nonzero() {
     let (_dir, cfg) = empty_config();
     let out = binary(&cfg).output().expect("run smited-watch");
