@@ -168,6 +168,35 @@ failure_dedupe_window_ms = 2000
     (dir, path)
 }
 
+/// Variant with a `failure_sensation` set so we can verify the on-exit
+/// failure path (and its suppression branches) at the wire level.
+fn write_failure_config(host: &str) -> (TempDir, std::path::PathBuf) {
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("watch.toml");
+    std::fs::write(
+        &path,
+        format!(
+            r#"
+[smited]
+host = "{host}"
+backend_id = "mock-owo"
+
+[smited.connection]
+timeout_ms = 1500
+strategy = "per_trigger"
+
+[on_exit]
+success_sensation = ""
+failure_sensation = "build_failed"
+success_min_duration_ms = 30000
+failure_dedupe_window_ms = 0
+"#
+        ),
+    )
+    .unwrap();
+    (dir, path)
+}
+
 fn run_binary_with(env_disable: bool, dry_run: bool, cfg: &std::path::Path, cmd: &str) -> i32 {
     let mut c = Command::cargo_bin("smited-watch").expect("binary built");
     c.arg("--no-banner").arg("--quiet").arg("--config").arg(cfg);
@@ -269,6 +298,86 @@ async fn smited_watch_disable_fires_no_triggers() {
     assert!(
         received.is_empty(),
         "SMITED_WATCH_DISABLE=1 must skip the trigger pipeline"
+    );
+
+    let _ = shutdown.send(());
+}
+
+/// Wire-level proof of fix #1: child killed by SIGINT (the PTY-raw-mode
+/// scenario where the wrapper never observes the signal itself) must NOT
+/// fire `failure_sensation`. We send SIGINT to the *child PID* so the
+/// wrapper's signal handler is bypassed, mirroring the PTY case where
+/// Ctrl-C bytes go through stdin into the PTY rather than to the wrapper.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn child_killed_by_sigint_does_not_fire_failure_sensation() {
+    let (addr, captured, shutdown) = spawn_fake_daemon().await;
+    let (dir, cfg) = write_failure_config(&addr.to_string());
+    let pid_file = dir.path().join("bash.pid");
+    let pid_file_str = pid_file.display().to_string();
+
+    let cfg_owned = cfg.clone();
+    let pid_file_clone = pid_file.clone();
+    let runner = tokio::task::spawn_blocking(move || {
+        // `exec sleep` so bash's PID *becomes* sleep — no descendants
+        // hanging on to the wrapper's stdio pipes after the signal
+        // (which would block the wrapper's tee tasks until sleep
+        // finishes naturally and turn this from a 1-second test into a
+        // 60-second one).
+        let script = format!("echo $$ > {pid_file_str}; exec sleep 60");
+        let mut c = Command::cargo_bin("smited-watch").expect("binary built");
+        c.arg("--no-banner")
+            .arg("--quiet")
+            .arg("--config")
+            .arg(&cfg_owned)
+            .arg("--")
+            .arg("bash")
+            .arg("-c")
+            .arg(&script)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        c.status().expect("run smited-watch").code().unwrap_or(-1)
+    });
+
+    // Give bash time to write its PID, then SIGINT the bash child directly.
+    let bash_pid: i32 = {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            if let Ok(s) = std::fs::read_to_string(&pid_file_clone) {
+                if let Ok(n) = s.trim().parse::<i32>() {
+                    break n;
+                }
+            }
+            if tokio::time::Instant::now() > deadline {
+                let _ = shutdown.send(());
+                panic!("bash never wrote its PID");
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    };
+    unsafe {
+        libc::kill(bash_pid as libc::pid_t, libc::SIGINT);
+    }
+    let _ = runner.await.unwrap();
+
+    // Allow drain.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    let received = captured.lock().await;
+    assert!(
+        received.is_empty(),
+        "child killed by user-initiated SIGINT must NOT fire failure_sensation \
+         (got {} requests: {:?})",
+        received.len(),
+        received
+            .iter()
+            .filter_map(|r| match &r.sensation {
+                Some(
+                    smited_watch::proto::smited::v1::trigger_request::Sensation::SensationName(n),
+                ) => Some(n.clone()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
     );
 
     let _ = shutdown.send(());

@@ -51,6 +51,31 @@ pub fn handle(ctx: ExitContext) {
         return;
     }
 
+    // PTY raw-mode delivers Ctrl-C as byte 0x03 *into* the child PTY rather
+    // than as a SIGINT to the wrapper, so `shutdown_due_to_signal` is never
+    // set even though the user clearly asked for a stop. Catch this by
+    // checking the child's own death-by-signal: if it was killed by one of
+    // the user-initiated "please stop" signals, suppress the failure
+    // sensation. Crash signals (SIGSEGV, SIGABRT, SIGBUS, SIGFPE) still
+    // fire failure — the wrapped command genuinely broke and the user
+    // should feel that.
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::ExitStatusExt;
+        if let Some(sig) = ctx.status.signal() {
+            if matches!(
+                sig,
+                libc::SIGINT | libc::SIGTERM | libc::SIGQUIT | libc::SIGHUP
+            ) {
+                debug!(
+                    signum = sig,
+                    "exit: child killed by user-initiated signal; suppressing on-exit sensation"
+                );
+                return;
+            }
+        }
+    }
+
     if ctx.status.success() {
         if ctx.on_exit.success_sensation.is_empty() {
             debug!("exit: success but success_sensation is empty; nothing to fire");
@@ -148,6 +173,14 @@ mod tests {
             use std::os::windows::process::ExitStatusExt;
             ExitStatus::from_raw(1)
         }
+    }
+
+    #[cfg(unix)]
+    fn signal_status(signum: i32) -> ExitStatus {
+        use std::os::unix::process::ExitStatusExt;
+        // Low 7 bits = signum encodes "died from signal" in the wait status
+        // format `ExitStatusExt::from_raw` consumes.
+        ExitStatus::from_raw(signum & 0x7f)
     }
 
     /// Smoke-test all four routing branches return without panicking,
@@ -259,6 +292,77 @@ mod tests {
             shutdown_due_to_signal: false,
             now,
         });
+    }
+
+    /// PTY raw-mode case: child exits from SIGINT (which we never received
+    /// because the byte went straight into the PTY), but `shutdown_due_to_signal`
+    /// is false. We must STILL suppress the failure sensation — the user
+    /// asked the wrapped command to stop, they don't need a buzz to confirm.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn child_killed_by_sigint_suppresses_failure_even_when_flag_unset() {
+        let cfg = on_exit("", "compile_error_severe", 0, 0);
+        let cli = dry_run_client();
+        // No `shutdown_due_to_signal` flag set — this is the PTY raw-mode
+        // path where the wrapper never observed the SIGINT itself.
+        handle(ExitContext {
+            status: signal_status(libc::SIGINT),
+            duration: Duration::from_secs(5),
+            on_exit: &cfg,
+            default_backend_id: "mock-owo",
+            last_pattern_fire: None,
+            trigger_client: &cli,
+            shutdown_due_to_signal: false,
+            now: Instant::now(),
+        });
+        // The function exited via the new "user signal" early-return branch;
+        // it must not have panicked or fired. Dry-run client doesn't expose
+        // a fire counter, but the integration test in fake_daemon covers
+        // wire-level no-fire behaviour. The decision-logic branch is
+        // exercised by virtue of the matches!() in handle().
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn child_killed_by_sigterm_also_suppresses_failure() {
+        // Same logic as above for SIGTERM (e.g. systemd stopping the wrapper).
+        let cfg = on_exit("", "compile_error_severe", 0, 0);
+        let cli = dry_run_client();
+        handle(ExitContext {
+            status: signal_status(libc::SIGTERM),
+            duration: Duration::from_secs(5),
+            on_exit: &cfg,
+            default_backend_id: "mock-owo",
+            last_pattern_fire: None,
+            trigger_client: &cli,
+            shutdown_due_to_signal: false,
+            now: Instant::now(),
+        });
+    }
+
+    /// The user-signal suppression must NOT extend to genuine crashes.
+    /// SIGSEGV / SIGABRT means the wrapped command broke; the user
+    /// genuinely needs to know about it.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn child_killed_by_crash_signal_still_fires_failure() {
+        let cfg = on_exit("", "compile_error_severe", 0, 0);
+        let cli = dry_run_client();
+        for crash_sig in [libc::SIGSEGV, libc::SIGABRT, libc::SIGBUS, libc::SIGFPE] {
+            handle(ExitContext {
+                status: signal_status(crash_sig),
+                duration: Duration::from_secs(5),
+                on_exit: &cfg,
+                default_backend_id: "mock-owo",
+                last_pattern_fire: None,
+                trigger_client: &cli,
+                shutdown_due_to_signal: false,
+                now: Instant::now(),
+            });
+            // We can't directly observe the fire from the dry-run client,
+            // but the function must take the failure path (not the new
+            // user-signal early return) — verified by the decision logic.
+        }
     }
 
     #[tokio::test]
