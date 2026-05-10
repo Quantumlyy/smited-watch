@@ -1,5 +1,6 @@
 //! smited-watch — wrap a command, scan its output, fire haptic gRPC triggers.
 
+pub mod cli;
 pub mod client;
 pub mod config;
 pub mod debounce;
